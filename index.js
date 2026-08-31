@@ -11,12 +11,14 @@ app.use(cors());
 app.use(express.json());
 
 // =====================================================
-// Firebase Admin
+// Firebase Admin (from Environment Variable)
 // =====================================================
-const serviceAccount = require("./serviceAccountKey.json");
+let serviceAccount;
 
-if (!serviceAccount || !serviceAccount.private_key) {
-  console.error("serviceAccountKey.json is missing or invalid");
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} catch (err) {
+  console.error("FIREBASE_SERVICE_ACCOUNT is missing or invalid");
   process.exit(1);
 }
 
