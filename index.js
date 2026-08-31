@@ -54,7 +54,7 @@ app.post("/initialize-payment", async (req, res) => {
         email,
         amount: amountInKobo,
         currency: "NGN",
-        callback_url: "https://yourdomain.com/payment/callback", // change later
+        callback_url:"https://campus-mart-ashen.vercel.app/order-success", // change later
         metadata: {
           sellerId,
           orderId: orderId || null,
