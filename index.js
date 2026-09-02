@@ -151,6 +151,134 @@ app.post("/paystack-webhook", async (req, res) => {
   }
 });
 
+
+// =====================================================
+// 3. REAL SELLER WITHDRAWAL (Paystack Transfer)
+// =====================================================
+app.post("/process-withdrawal", async (req, res) => {
+  try {
+    const {
+      sellerId,
+      amount,
+      bankName,
+      bankCode,
+      accountNumber,
+      accountName,
+    } = req.body;
+
+    if (!sellerId || !amount || !bankCode || !accountNumber || !accountName) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    if (Number(amount) < 1000) {
+      return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
+    }
+
+    // 1. Check seller balance
+    const sellerRef = db.collection("users").doc(sellerId);
+    const sellerSnap = await sellerRef.get();
+
+    if (!sellerSnap.exists) {
+      return res.status(404).json({ error: "Seller not found" });
+    }
+
+    const sellerData = sellerSnap.data();
+    const availableBalance = Number(sellerData.availableBalance || 0);
+
+    if (availableBalance < Number(amount)) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    // 2. Create Transfer Recipient on Paystack
+    const recipientRes = await axios.post(
+      "https://api.paystack.co/transferrecipient",
+      {
+        type: "nuban",
+        name: accountName,
+        account_number: accountNumber,
+        bank_code: bankCode,
+        currency: "NGN",
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!recipientRes.data.status) {
+      return res.status(400).json({
+        error: recipientRes.data.message || "Could not create recipient",
+      });
+    }
+
+    const recipientCode = recipientRes.data.data.recipient_code;
+
+    // 3. Initiate real transfer
+    const transferRes = await axios.post(
+      "https://api.paystack.co/transfer",
+      {
+        source: "balance",
+        amount: Math.round(Number(amount) * 100), // kobo
+        recipient: recipientCode,
+        reason: `CampusMart seller withdrawal - ${sellerId}`,
+        reference: `WD_${sellerId}_${Date.now()}`,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!transferRes.data.status) {
+      return res.status(400).json({
+        error: transferRes.data.message || "Transfer failed",
+      });
+    }
+
+    // 4. Deduct balance + save withdrawal record
+    const batch = db.batch();
+
+    batch.update(sellerRef, {
+      availableBalance: FieldValue.increment(-Number(amount)),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    const withdrawalRef = db.collection("withdrawals").doc();
+    batch.set(withdrawalRef, {
+      sellerId,
+      amount: Number(amount),
+      bankName: bankName || "",
+      bankCode,
+      accountNumber,
+      accountName,
+      status: "Processing",
+      paystackTransferCode: transferRes.data.data.transfer_code,
+      paystackReference: transferRes.data.data.reference,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    res.json({
+      success: true,
+      message: "Transfer initiated. Money will arrive in the seller's bank shortly.",
+      transferCode: transferRes.data.data.transfer_code,
+    });
+  } catch (error) {
+    console.error("Withdrawal error:", error.response?.data || error.message);
+    res.status(500).json({
+      error:
+        error.response?.data?.message ||
+        "Could not process withdrawal. Please try again.",
+    });
+  }
+});
+
 // =====================================================
 // Start server
 // =====================================================
