@@ -279,6 +279,136 @@ app.post("/process-withdrawal", async (req, res) => {
   }
 });
 
+
+// =====================================================
+// 4. PLATFORM FEE WITHDRAWAL (Admin / CampusMart)
+// =====================================================
+app.post("/process-platform-withdrawal", async (req, res) => {
+  try {
+    const {
+      amount,
+      bankName,
+      bankCode,
+      accountNumber,
+      accountName,
+      adminId,
+    } = req.body;
+
+    if (!amount || !bankCode || !accountNumber || !accountName) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    if (Number(amount) < 1000) {
+      return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
+    }
+
+    // 1. Calculate available platform fees
+    const feesSnap = await db.collection("platformFees").get();
+    let totalFees = 0;
+    feesSnap.forEach((d) => {
+      totalFees += Number(d.data().platformFee) || 0;
+    });
+
+    const withdrawnSnap = await db
+      .collection("platformWithdrawals")
+      .where("status", "in", ["Successful", "Processing", "Pending"])
+      .get();
+
+    let alreadyWithdrawn = 0;
+    withdrawnSnap.forEach((d) => {
+      alreadyWithdrawn += Number(d.data().amount) || 0;
+    });
+
+    const available = totalFees - alreadyWithdrawn;
+
+    if (Number(amount) > available) {
+      return res.status(400).json({
+        error: `Insufficient platform balance. Available: ₦${available.toLocaleString()}`,
+      });
+    }
+
+    // 2. Create Paystack recipient
+    const recipientRes = await axios.post(
+      "https://api.paystack.co/transferrecipient",
+      {
+        type: "nuban",
+        name: accountName,
+        account_number: accountNumber,
+        bank_code: bankCode,
+        currency: "NGN",
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!recipientRes.data.status) {
+      return res.status(400).json({
+        error: recipientRes.data.message || "Could not create recipient",
+      });
+    }
+
+    const recipientCode = recipientRes.data.data.recipient_code;
+
+    // 3. Initiate transfer
+    const transferRes = await axios.post(
+      "https://api.paystack.co/transfer",
+      {
+        source: "balance",
+        amount: Math.round(Number(amount) * 100),
+        recipient: recipientCode,
+        reason: "CampusMart platform fee withdrawal",
+        reference: `PFEE_${Date.now()}`,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!transferRes.data.status) {
+      return res.status(400).json({
+        error: transferRes.data.message || "Transfer failed",
+      });
+    }
+
+    // 4. Record withdrawal
+    await db.collection("platformWithdrawals").add({
+      amount: Number(amount),
+      bankName: bankName || "",
+      bankCode,
+      accountNumber,
+      accountName,
+      adminId: adminId || null,
+      status: "Processing",
+      paystackTransferCode: transferRes.data.data.transfer_code,
+      paystackReference: transferRes.data.data.reference,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    res.json({
+      success: true,
+      message: "Platform fee withdrawal initiated",
+      transferCode: transferRes.data.data.transfer_code,
+    });
+  } catch (error) {
+    console.error(
+      "Platform withdrawal error:",
+      error.response?.data || error.message
+    );
+    res.status(500).json({
+      error:
+        error.response?.data?.message ||
+        "Could not process platform withdrawal",
+    });
+  }
+});
 // =====================================================
 // Start server
 // =====================================================
