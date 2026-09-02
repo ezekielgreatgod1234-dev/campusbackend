@@ -13,6 +13,10 @@ const {
   FieldValue,
 } = require("firebase-admin/firestore");
 
+const {
+  getAuth,
+} = require("firebase-admin/auth");
+
 require("dotenv").config();
 
 const app = express();
@@ -43,6 +47,7 @@ initializeApp({
 });
 
 const db = getFirestore();
+const adminAuth = getAuth();
 
 // =====================================================
 // PAYSTACK SECRET
@@ -52,427 +57,384 @@ const PAYSTACK_SECRET =
   process.env.PAYSTACK_SECRET;
 
 // =====================================================
-// RESET SECRET
+// HELPER: VERIFY FIREBASE USER
 // =====================================================
-//
-// Add this to your .env:
-//
-// RESET_EARNINGS_SECRET=your-very-secret-value
-//
-// DO NOT put this value in your frontend or GitHub.
-//
 
-const RESET_EARNINGS_SECRET =
-  process.env.RESET_EARNINGS_SECRET;
+async function verifyFirebaseUser(req) {
+  const authorization =
+    req.headers.authorization || "";
+
+  if (!authorization.startsWith("Bearer ")) {
+    throw new Error(
+      "Missing Firebase authentication token"
+    );
+  }
+
+  const idToken =
+    authorization.replace("Bearer ", "");
+
+  const decodedToken =
+    await adminAuth.verifyIdToken(idToken);
+
+  return decodedToken;
+}
 
 // =====================================================
 // 1. INITIALIZE PAYMENT
 // =====================================================
 
-app.post("/initialize-payment", async (req, res) => {
-  try {
-    const {
-      email,
-      amount,
-      sellerId,
-      orderId,
-      productName,
-    } = req.body;
-
-    if (!email || !amount || !sellerId) {
-      return res.status(400).json({
-        error:
-          "email, amount and sellerId are required",
-      });
-    }
-
-    const numericAmount = Number(amount);
-
-    if (
-      !Number.isFinite(numericAmount) ||
-      numericAmount <= 0
-    ) {
-      return res.status(400).json({
-        error: "Invalid payment amount",
-      });
-    }
-
-    const amountInKobo = Math.round(
-      numericAmount * 100
-    );
-
-    const response = await axios.post(
-      "https://api.paystack.co/transaction/initialize",
-      {
+app.post(
+  "/initialize-payment",
+  async (req, res) => {
+    try {
+      const {
         email,
-        amount: amountInKobo,
-        currency: "NGN",
+        amount,
+        sellerId,
+        orderId,
+        productName,
+      } = req.body;
 
-        callback_url:
-          "https://campus-mart-ashen.vercel.app/order-success",
-
-        metadata: {
-          sellerId,
-          orderId: orderId || null,
-          productName:
-            productName || "CampusMart Order",
-        },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          "Content-Type": "application/json",
-        },
+      if (!email || !amount || !sellerId) {
+        return res.status(400).json({
+          error:
+            "email, amount and sellerId are required",
+        });
       }
-    );
 
-    if (!response.data.status) {
-      return res.status(400).json({
-        error:
-          response.data.message ||
-          "Could not initialize payment",
+      const amountInKobo =
+        Math.round(Number(amount) * 100);
+
+      if (
+        !Number.isFinite(amountInKobo) ||
+        amountInKobo <= 0
+      ) {
+        return res.status(400).json({
+          error: "Invalid payment amount",
+        });
+      }
+
+      const response =
+        await axios.post(
+          "https://api.paystack.co/transaction/initialize",
+          {
+            email,
+            amount: amountInKobo,
+            currency: "NGN",
+
+            callback_url:
+              "https://campus-mart-ashen.vercel.app/order-success",
+
+            metadata: {
+              sellerId,
+              orderId: orderId || null,
+              productName:
+                productName ||
+                "CampusMart Order",
+            },
+          },
+          {
+            headers: {
+              Authorization:
+                `Bearer ${PAYSTACK_SECRET}`,
+
+              "Content-Type":
+                "application/json",
+            },
+          }
+        );
+
+      if (!response.data.status) {
+        return res.status(400).json({
+          error:
+            response.data.message ||
+            "Payment initialization failed",
+        });
+      }
+
+      return res.json({
+        success: true,
+
+        authorization_url:
+          response.data.data.authorization_url,
+
+        reference:
+          response.data.data.reference,
+      });
+    } catch (error) {
+      console.error(
+        "Initialize payment error:",
+        error.response?.data ||
+          error.message
+      );
+
+      return res.status(500).json({
+        error: "Could not start payment",
       });
     }
-
-    res.json({
-      success: true,
-      authorization_url:
-        response.data.data.authorization_url,
-      reference:
-        response.data.data.reference,
-    });
-  } catch (error) {
-    console.error(
-      "Initialize payment error:",
-      error.response?.data || error.message
-    );
-
-    res.status(500).json({
-      error: "Could not start payment",
-    });
   }
-});
+);
 
 // =====================================================
 // 2. PAYSTACK WEBHOOK
 // =====================================================
 //
-// Buyer pays
+// 5% CampusMart
+// 95% Seller
 //
-// Example:
+// ALSO CREATES:
+// earnings/{paystackReference}
 //
-// ₦10,000
-//
-// CampusMart fee = ₦500
-// Seller gets     = ₦9,500
-//
-// This updates:
-//
-// users/{sellerId}
-//   totalEarnings
-//   availableBalance
-//   totalPlatformFees
-//
-// And creates:
-//
-// earnings/{earningId}
-// platformFees/{feeId}
-//
-// It also protects against duplicate webhooks.
+// This means your Seller Earnings page can
+// listen to the earnings collection in real time.
 // =====================================================
 
-app.post("/paystack-webhook", async (req, res) => {
-  try {
-    // -------------------------------------------------
-    // VERIFY PAYSTACK SIGNATURE
-    // -------------------------------------------------
+app.post(
+  "/paystack-webhook",
+  async (req, res) => {
+    try {
+      // -------------------------------------------------
+      // VERIFY PAYSTACK SIGNATURE
+      // -------------------------------------------------
 
-    const hash = crypto
-      .createHmac(
-        "sha512",
-        PAYSTACK_SECRET
-      )
-      .update(JSON.stringify(req.body))
-      .digest("hex");
+      const hash =
+        crypto
+          .createHmac(
+            "sha512",
+            PAYSTACK_SECRET
+          )
+          .update(
+            JSON.stringify(req.body)
+          )
+          .digest("hex");
 
-    const signature =
-      req.headers["x-paystack-signature"];
+      const signature =
+        req.headers[
+          "x-paystack-signature"
+        ];
 
-    if (!signature || hash !== signature) {
-      console.error(
-        "Invalid Paystack webhook signature"
-      );
-
-      return res
-        .status(401)
-        .send("Invalid signature");
-    }
-
-    const event = req.body;
-
-    // -------------------------------------------------
-    // ONLY PROCESS SUCCESSFUL CHARGES
-    // -------------------------------------------------
-
-    if (event.event !== "charge.success") {
-      return res.status(200).send("OK");
-    }
-
-    const data = event.data || {};
-
-    const metadata = data.metadata || {};
-
-    const sellerId = metadata.sellerId;
-    const orderId = metadata.orderId;
-
-    const reference = data.reference;
-
-    const totalAmount = Number(
-      data.amount || 0
-    ) / 100;
-
-    // -------------------------------------------------
-    // VALIDATION
-    // -------------------------------------------------
-
-    if (!sellerId) {
-      console.warn(
-        "Paystack payment has no sellerId:",
-        reference
-      );
-
-      return res.status(200).send("OK");
-    }
-
-    if (!reference) {
-      console.warn(
-        "Paystack payment has no reference"
-      );
-
-      return res.status(200).send("OK");
-    }
-
-    if (
-      !Number.isFinite(totalAmount) ||
-      totalAmount <= 0
-    ) {
-      console.warn(
-        "Invalid Paystack amount:",
-        totalAmount
-      );
-
-      return res.status(200).send("OK");
-    }
-
-    // -------------------------------------------------
-    // CALCULATE 5% / 95%
-    // -------------------------------------------------
-
-    const platformFee = Number(
-      (totalAmount * 0.05).toFixed(2)
-    );
-
-    const sellerAmount = Number(
-      (totalAmount * 0.95).toFixed(2)
-    );
-
-    // -------------------------------------------------
-    // DUPLICATE PAYMENT PROTECTION
-    // -------------------------------------------------
-    //
-    // We use the Paystack reference as the unique
-    // payment identifier.
-    //
-    // If Paystack sends the webhook again,
-    // the seller will NOT be credited twice.
-    //
-
-    const paymentRef = db
-      .collection("processedPayments")
-      .doc(reference);
-
-    const sellerRef = db
-      .collection("users")
-      .doc(sellerId);
-
-    const earningsRef = db
-      .collection("earnings")
-      .doc();
-
-    const platformFeeRef = db
-      .collection("platformFees")
-      .doc();
-
-    let alreadyProcessed = false;
-
-    await db.runTransaction(
-      async (transaction) => {
-        // -------------------------------------------------
-        // CHECK IF PAYMENT WAS ALREADY PROCESSED
-        // -------------------------------------------------
-
-        const paymentSnap =
-          await transaction.get(paymentRef);
-
-        if (paymentSnap.exists) {
-          alreadyProcessed = true;
-          return;
-        }
-
-        // -------------------------------------------------
-        // GET SELLER
-        // -------------------------------------------------
-
-        const sellerSnap =
-          await transaction.get(sellerRef);
-
-        if (!sellerSnap.exists) {
-          throw new Error(
-            `Seller ${sellerId} does not exist`
-          );
-        }
-
-        // -------------------------------------------------
-        // UPDATE SELLER BALANCE
-        // -------------------------------------------------
-
-        transaction.set(
-          sellerRef,
-          {
-            totalEarnings:
-              FieldValue.increment(
-                sellerAmount
-              ),
-
-            availableBalance:
-              FieldValue.increment(
-                sellerAmount
-              ),
-
-            totalPlatformFees:
-              FieldValue.increment(
-                platformFee
-              ),
-
-            updatedAt:
-              FieldValue.serverTimestamp(),
-          },
-          {
-            merge: true,
-          }
+      if (
+        !signature ||
+        hash !== signature
+      ) {
+        console.error(
+          "Invalid Paystack webhook signature"
         );
 
-        // -------------------------------------------------
-        // CREATE EARNINGS RECORD
-        // -------------------------------------------------
+        return res
+          .status(401)
+          .send("Invalid signature");
+      }
 
-        transaction.set(
-          earningsRef,
-          {
-            sellerId,
+      const event = req.body;
 
-            orderId:
-              orderId || null,
+      // -------------------------------------------------
+      // ONLY PROCESS SUCCESSFUL PAYMENTS
+      // -------------------------------------------------
 
-            type: "sale",
+      if (
+        event.event !==
+        "charge.success"
+      ) {
+        return res
+          .status(200)
+          .send("OK");
+      }
 
-            title:
-              metadata.productName
-                ? metadata.productName
-                : orderId
-                  ? `Order #${String(
-                      orderId
-                    )
-                      .slice(0, 6)
-                      .toUpperCase()}`
-                  : `Order #${String(
-                      reference
-                    )
-                      .slice(0, 6)
-                      .toUpperCase()}`,
+      const data = event.data;
 
-            description:
-              metadata.productName ||
-              "Sale",
+      const metadata =
+        data.metadata || {};
 
-            gross: totalAmount,
+      const sellerId =
+        metadata.sellerId;
 
-            platformFee,
+      const orderId =
+        metadata.orderId;
 
-            amount: sellerAmount,
+      const totalAmount =
+        Number(data.amount || 0) / 100;
 
-            status: "Completed",
+      const reference =
+        data.reference;
 
-            paystackReference:
-              reference,
+      // -------------------------------------------------
+      // SELLER MUST EXIST
+      // -------------------------------------------------
 
-            createdAt:
-              FieldValue.serverTimestamp(),
-          }
+      if (!sellerId) {
+        console.warn(
+          "Payment has no sellerId:",
+          reference
         );
 
-        // -------------------------------------------------
-        // CREATE PLATFORM FEE RECORD
-        // -------------------------------------------------
+        return res
+          .status(200)
+          .send("OK");
+      }
 
-        transaction.set(
-          platformFeeRef,
-          {
-            sellerId,
+      if (
+        !reference ||
+        totalAmount <= 0
+      ) {
+        return res
+          .status(200)
+          .send("OK");
+      }
 
-            orderId:
-              orderId || null,
+      // -------------------------------------------------
+      // CALCULATE COMMISSION
+      // -------------------------------------------------
 
-            totalAmount,
+      const platformFee =
+        Number(
+          (
+            totalAmount * 0.05
+          ).toFixed(2)
+        );
 
-            platformFee,
+      const sellerAmount =
+        Number(
+          (
+            totalAmount * 0.95
+          ).toFixed(2)
+        );
 
+      // -------------------------------------------------
+      // USE PAYSTACK REFERENCE AS DOCUMENT ID
+      //
+      // This prevents duplicate webhook processing.
+      // -------------------------------------------------
+
+      const earningRef =
+        db
+          .collection("earnings")
+          .doc(reference);
+
+      const existingEarning =
+        await earningRef.get();
+
+      if (existingEarning.exists) {
+        console.log(
+          `Payment ${reference} already processed.`
+        );
+
+        return res
+          .status(200)
+          .send("Already processed");
+      }
+
+      // -------------------------------------------------
+      // SELLER DOCUMENT
+      // -------------------------------------------------
+
+      const sellerRef =
+        db
+          .collection("users")
+          .doc(sellerId);
+
+      // -------------------------------------------------
+      // CREATE BATCH
+      // -------------------------------------------------
+
+      const batch =
+        db.batch();
+
+      // -------------------------------------------------
+      // UPDATE SELLER BALANCE
+      //
+      // IMPORTANT:
+      // Previously your code only updated
+      // availableBalance.
+      //
+      // Now all three values update.
+      // -------------------------------------------------
+
+      batch.set(
+        sellerRef,
+        {
+          availableBalance:
+            FieldValue.increment(
+              sellerAmount
+            ),
+
+          totalEarnings:
+            FieldValue.increment(
+              sellerAmount
+            ),
+
+          totalPlatformFees:
+            FieldValue.increment(
+              platformFee
+            ),
+
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        {
+          merge: true,
+        }
+      );
+
+      // -------------------------------------------------
+      // CREATE EARNINGS RECORD
+      // -------------------------------------------------
+
+      batch.set(
+        earningRef,
+        {
+          sellerId,
+
+          orderId:
+            orderId || null,
+
+          type: "sale",
+
+          title:
+            orderId
+              ? `Order #${String(
+                  orderId
+                )
+                  .slice(0, 6)
+                  .toUpperCase()}`
+              : "CampusMart Sale",
+
+          description:
+            metadata.productName ||
+            "Sale",
+
+          amount:
             sellerAmount,
 
-            paystackReference:
-              reference,
+          gross:
+            totalAmount,
 
-            createdAt:
-              FieldValue.serverTimestamp(),
-          }
-        );
+          platformFee:
+            platformFee,
 
-        // -------------------------------------------------
-        // MARK ORDER AS PAID
-        // -------------------------------------------------
+          status:
+            "Completed",
 
-        if (orderId) {
-          const orderRef = db
-            .collection("orders")
-            .doc(orderId);
+          paystackReference:
+            reference,
 
-          transaction.set(
-            orderRef,
-            {
-              paymentStatus: "paid",
+          createdAt:
+            FieldValue.serverTimestamp(),
 
-              paidAt:
-                FieldValue.serverTimestamp(),
-
-              paystackReference:
-                reference,
-
-              updatedAt:
-                FieldValue.serverTimestamp(),
-            },
-            {
-              merge: true,
-            }
-          );
+          updatedAt:
+            FieldValue.serverTimestamp(),
         }
+      );
 
-        // -------------------------------------------------
-        // MARK PAYMENT AS PROCESSED
-        // -------------------------------------------------
+      // -------------------------------------------------
+      // RECORD PLATFORM FEE
+      // -------------------------------------------------
 
-        transaction.set(paymentRef, {
-          reference,
-
+      batch.set(
+        db
+          .collection("platformFees")
+          .doc(reference),
+        {
           sellerId,
 
           orderId:
@@ -484,149 +446,10 @@ app.post("/paystack-webhook", async (req, res) => {
 
           sellerAmount,
 
-          processedAt:
-            FieldValue.serverTimestamp(),
-        });
-      }
-    );
+          paystackReference:
+            reference,
 
-    // -------------------------------------------------
-    // DUPLICATE WEBHOOK
-    // -------------------------------------------------
-
-    if (alreadyProcessed) {
-      console.log(
-        `Payment ${reference} was already processed.`
-      );
-
-      return res.status(200).send("OK");
-    }
-
-    // -------------------------------------------------
-    // SUCCESS
-    // -------------------------------------------------
-
-    console.log(
-      `Payment successful: ${reference}`
-    );
-
-    console.log(
-      `Seller: ${sellerId}`
-    );
-
-    console.log(
-      `Gross: ₦${totalAmount}`
-    );
-
-    console.log(
-      `Platform fee: ₦${platformFee}`
-    );
-
-    console.log(
-      `Seller credited: ₦${sellerAmount}`
-    );
-
-    return res.status(200).send("OK");
-  } catch (error) {
-    console.error(
-      "Paystack webhook error:",
-      error.response?.data ||
-        error.message ||
-        error
-    );
-
-    return res
-      .status(500)
-      .send("Error");
-  }
-});
-
-// =====================================================
-// 3. ONE-TIME SELLER EARNINGS RESET
-// =====================================================
-//
-// THIS IS FOR YOUR CURRENT RESET ONLY.
-//
-// It:
-//
-// 1. Sets totalEarnings to 0
-// 2. Sets availableBalance to 0
-// 3. Sets totalPlatformFees to 0
-// 4. Deletes the seller's earnings records
-//
-// IMPORTANT:
-//
-// It DOES NOT delete platformFees.
-//
-// Why?
-//
-// Because platformFees belongs to CampusMart's
-// financial records and may be needed for admin
-// accounting.
-//
-// If you specifically want to erase those too,
-// I can give you a separate controlled reset.
-// =====================================================
-
-app.post(
-  "/reset-seller-earnings",
-  async (req, res) => {
-    try {
-      // -------------------------------------------------
-      // SECURITY CHECK
-      // -------------------------------------------------
-
-      const providedSecret =
-        req.headers["x-reset-secret"];
-
-      if (
-        !RESET_EARNINGS_SECRET ||
-        providedSecret !==
-          RESET_EARNINGS_SECRET
-      ) {
-        return res.status(401).json({
-          error: "Unauthorized",
-        });
-      }
-
-      const { sellerId } = req.body;
-
-      if (!sellerId) {
-        return res.status(400).json({
-          error: "sellerId is required",
-        });
-      }
-
-      // -------------------------------------------------
-      // SELLER REFERENCE
-      // -------------------------------------------------
-
-      const sellerRef = db
-        .collection("users")
-        .doc(sellerId);
-
-      const sellerSnap =
-        await sellerRef.get();
-
-      if (!sellerSnap.exists) {
-        return res.status(404).json({
-          error: "Seller not found",
-        });
-      }
-
-      // -------------------------------------------------
-      // RESET SELLER BALANCE
-      // -------------------------------------------------
-
-      await sellerRef.set(
-        {
-          totalEarnings: 0,
-
-          availableBalance: 0,
-
-          totalPlatformFees: 0,
-
-          updatedAt:
+          createdAt:
             FieldValue.serverTimestamp(),
         },
         {
@@ -635,10 +458,142 @@ app.post(
       );
 
       // -------------------------------------------------
-      // FIND OLD EARNINGS
+      // UPDATE ORDER
       // -------------------------------------------------
 
-      const earningsSnap =
+      if (orderId) {
+        batch.set(
+          db
+            .collection("orders")
+            .doc(orderId),
+          {
+            paymentStatus:
+              "paid",
+
+            paidAt:
+              FieldValue.serverTimestamp(),
+
+            paystackReference:
+              reference,
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          }
+        );
+      }
+
+      // -------------------------------------------------
+      // COMMIT EVERYTHING
+      // -------------------------------------------------
+
+      await batch.commit();
+
+      console.log(
+        "================================"
+      );
+
+      console.log(
+        "PAYMENT SUCCESSFUL"
+      );
+
+      console.log(
+        `Reference: ${reference}`
+      );
+
+      console.log(
+        `Seller: ${sellerId}`
+      );
+
+      console.log(
+        `Gross: ₦${totalAmount}`
+      );
+
+      console.log(
+        `Platform fee: ₦${platformFee}`
+      );
+
+      console.log(
+        `Seller receives: ₦${sellerAmount}`
+      );
+
+      console.log(
+        "================================"
+      );
+
+      return res
+        .status(200)
+        .send("OK");
+    } catch (error) {
+      console.error(
+        "Paystack webhook error:",
+        error
+      );
+
+      return res
+        .status(500)
+        .send("Error");
+    }
+  }
+);
+
+// =====================================================
+// 3. RESET SELLER EARNINGS
+// =====================================================
+//
+// THIS WILL:
+//
+// DELETE:
+// earnings/{sellerEarnings}
+//
+// RESET:
+// users/{sellerId}.totalEarnings = 0
+// users/{sellerId}.availableBalance = 0
+// users/{sellerId}.totalPlatformFees = 0
+//
+// IT DOES NOT DELETE:
+// withdrawals
+// platformFees
+// orders
+//
+// The seller must be authenticated and can only
+// reset their own earnings.
+// =====================================================
+
+app.post(
+  "/reset-earnings",
+  async (req, res) => {
+    try {
+      // -------------------------------------------------
+      // VERIFY LOGGED-IN SELLER
+      // -------------------------------------------------
+
+      const decodedUser =
+        await verifyFirebaseUser(req);
+
+      const authenticatedUid =
+        decodedUser.uid;
+
+      // -------------------------------------------------
+      // NEVER TRUST sellerId FROM THE BODY
+      //
+      // The logged-in Firebase UID is used.
+      // -------------------------------------------------
+
+      const sellerId =
+        authenticatedUid;
+
+      console.log(
+        `Resetting earnings for seller: ${sellerId}`
+      );
+
+      // -------------------------------------------------
+      // FIND SELLER EARNINGS
+      // -------------------------------------------------
+
+      const earningsSnapshot =
         await db
           .collection("earnings")
           .where(
@@ -648,65 +603,82 @@ app.post(
           )
           .get();
 
+      console.log(
+        `Found ${earningsSnapshot.size} earnings records.`
+      );
+
       // -------------------------------------------------
-      // DELETE IN BATCHES
+      // FIRESTORE BATCH LIMIT
+      //
+      // Firestore allows max 500 writes per batch.
+      // We use 400 to stay safe.
       // -------------------------------------------------
 
-      let batch = db.batch();
+      const docs =
+        earningsSnapshot.docs;
 
-      let deletedCount = 0;
+      const chunkSize = 400;
 
       for (
-        const earningDoc of
-          earningsSnap.docs
+        let i = 0;
+        i < docs.length;
+        i += chunkSize
       ) {
-        batch.delete(
-          earningDoc.ref
+        const chunk =
+          docs.slice(
+            i,
+            i + chunkSize
+          );
+
+        const batch =
+          db.batch();
+
+        chunk.forEach(
+          (earningDoc) => {
+            batch.delete(
+              earningDoc.ref
+            );
+          }
         );
 
-        deletedCount++;
-
-        // Firestore batch limit safety
-        if (
-          deletedCount % 400 === 0
-        ) {
-          await batch.commit();
-
-          batch = db.batch();
-        }
-      }
-
-      // Commit remaining deletions
-      if (
-        deletedCount % 400 !== 0
-      ) {
         await batch.commit();
       }
 
-      console.log(
-        `Reset seller ${sellerId}`
-      );
+      // -------------------------------------------------
+      // RESET SELLER BALANCES
+      // -------------------------------------------------
+
+      await db
+        .collection("users")
+        .doc(sellerId)
+        .set(
+          {
+            totalEarnings: 0,
+
+            availableBalance: 0,
+
+            totalPlatformFees: 0,
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          }
+        );
 
       console.log(
-        `Deleted ${deletedCount} earnings records`
+        `Earnings reset completed for ${sellerId}`
       );
 
       return res.json({
         success: true,
 
         message:
-          "Seller earnings successfully reset.",
-
-        sellerId,
+          "Seller earnings have been reset.",
 
         deletedEarnings:
-          deletedCount,
-
-        totalEarnings: 0,
-
-        availableBalance: 0,
-
-        totalPlatformFees: 0,
+          earningsSnapshot.size,
       });
     } catch (error) {
       console.error(
@@ -716,7 +688,8 @@ app.post(
 
       return res.status(500).json({
         error:
-          "Could not reset seller earnings",
+          error.message ||
+          "Could not reset earnings.",
       });
     }
   }
@@ -752,23 +725,8 @@ app.post(
         });
       }
 
-      const withdrawalAmount =
-        Number(amount);
-
       if (
-        !Number.isFinite(
-          withdrawalAmount
-        ) ||
-        withdrawalAmount <= 0
-      ) {
-        return res.status(400).json({
-          error:
-            "Invalid withdrawal amount",
-        });
-      }
-
-      if (
-        withdrawalAmount < 1000
+        Number(amount) < 1000
       ) {
         return res.status(400).json({
           error:
@@ -777,12 +735,13 @@ app.post(
       }
 
       // -------------------------------------------------
-      // CHECK SELLER BALANCE
+      // CHECK SELLER
       // -------------------------------------------------
 
-      const sellerRef = db
-        .collection("users")
-        .doc(sellerId);
+      const sellerRef =
+        db
+          .collection("users")
+          .doc(sellerId);
 
       const sellerSnap =
         await sellerRef.get();
@@ -805,7 +764,7 @@ app.post(
 
       if (
         availableBalance <
-        withdrawalAmount
+        Number(amount)
       ) {
         return res.status(400).json({
           error:
@@ -849,7 +808,8 @@ app.post(
       ) {
         return res.status(400).json({
           error:
-            recipientRes.data.message ||
+            recipientRes.data
+              .message ||
             "Could not create recipient",
         });
       }
@@ -871,9 +831,10 @@ app.post(
           {
             source: "balance",
 
-            amount: Math.round(
-              withdrawalAmount * 100
-            ),
+            amount:
+              Math.round(
+                Number(amount) * 100
+              ),
 
             recipient:
               recipientCode,
@@ -906,20 +867,28 @@ app.post(
       }
 
       // -------------------------------------------------
-      // DEDUCT BALANCE + SAVE WITHDRAWAL
+      // DEDUCT BALANCE
       // -------------------------------------------------
 
-      const batch = db.batch();
+      const batch =
+        db.batch();
 
-      batch.update(sellerRef, {
-        availableBalance:
-          FieldValue.increment(
-            -withdrawalAmount
-          ),
+      batch.update(
+        sellerRef,
+        {
+          availableBalance:
+            FieldValue.increment(
+              -Number(amount)
+            ),
 
-        updatedAt:
-          FieldValue.serverTimestamp(),
-      });
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        }
+      );
+
+      // -------------------------------------------------
+      // CREATE WITHDRAWAL RECORD
+      // -------------------------------------------------
 
       const withdrawalRef =
         db
@@ -932,7 +901,7 @@ app.post(
           sellerId,
 
           amount:
-            withdrawalAmount,
+            Number(amount),
 
           bankName:
             bankName || "",
@@ -1019,23 +988,8 @@ app.post(
         });
       }
 
-      const withdrawalAmount =
-        Number(amount);
-
       if (
-        !Number.isFinite(
-          withdrawalAmount
-        ) ||
-        withdrawalAmount <= 0
-      ) {
-        return res.status(400).json({
-          error:
-            "Invalid withdrawal amount",
-        });
-      }
-
-      if (
-        withdrawalAmount < 1000
+        Number(amount) < 1000
       ) {
         return res.status(400).json({
           error:
@@ -1044,7 +998,7 @@ app.post(
       }
 
       // -------------------------------------------------
-      // CALCULATE AVAILABLE PLATFORM FEES
+      // CALCULATE PLATFORM FEES
       // -------------------------------------------------
 
       const feesSnap =
@@ -1062,7 +1016,7 @@ app.post(
       });
 
       // -------------------------------------------------
-      // CHECK ALREADY WITHDRAWN
+      // ALREADY WITHDRAWN
       // -------------------------------------------------
 
       const withdrawnSnap =
@@ -1097,7 +1051,7 @@ app.post(
         alreadyWithdrawn;
 
       if (
-        withdrawalAmount >
+        Number(amount) >
         available
       ) {
         return res.status(400).json({
@@ -1107,7 +1061,7 @@ app.post(
       }
 
       // -------------------------------------------------
-      // CREATE PAYSTACK RECIPIENT
+      // CREATE RECIPIENT
       // -------------------------------------------------
 
       const recipientRes =
@@ -1152,7 +1106,7 @@ app.post(
           .recipient_code;
 
       // -------------------------------------------------
-      // INITIATE TRANSFER
+      // TRANSFER
       // -------------------------------------------------
 
       const transferRes =
@@ -1161,9 +1115,10 @@ app.post(
           {
             source: "balance",
 
-            amount: Math.round(
-              withdrawalAmount * 100
-            ),
+            amount:
+              Math.round(
+                Number(amount) * 100
+              ),
 
             recipient:
               recipientCode,
@@ -1196,7 +1151,7 @@ app.post(
       }
 
       // -------------------------------------------------
-      // SAVE PLATFORM WITHDRAWAL
+      // RECORD WITHDRAWAL
       // -------------------------------------------------
 
       await db
@@ -1205,7 +1160,7 @@ app.post(
         )
         .add({
           amount:
-            withdrawalAmount,
+            Number(amount),
 
           bankName:
             bankName || "",
@@ -1267,13 +1222,16 @@ app.post(
 // HEALTH CHECK
 // =====================================================
 
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    message:
-      "CampusMart payment server is running",
-  });
-});
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
+      success: true,
+      message:
+        "CampusMart payment server is running",
+    });
+  }
+);
 
 // =====================================================
 // START SERVER
@@ -1282,8 +1240,11 @@ app.get("/", (req, res) => {
 const PORT =
   process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(
-    `Server running on port ${PORT}`
-  );
-});
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `Server running on port ${PORT}`
+    );
+  }
+);
