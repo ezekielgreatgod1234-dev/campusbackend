@@ -22,7 +22,24 @@ require("dotenv").config();
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+
+// =====================================================
+// IMPORTANT: capture the RAW request body for the
+// webhook route so we can verify Paystack's signature
+// against the exact bytes they sent (not a re-serialized
+// copy of the parsed JSON, which can mismatch).
+// This must be registered BEFORE express.json() runs
+// for that route, so we use a verify() hook on the
+// json parser itself.
+// =====================================================
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      // Stash the raw bytes on the request for later use
+      req.rawBody = buf;
+    },
+  })
+);
 
 // =====================================================
 // FIREBASE ADMIN
@@ -178,6 +195,14 @@ app.post("/initialize-payment", async (req, res) => {
 
 // =====================================================
 // 1b. VERIFY PAYMENT
+// This endpoint only ever READS the transaction status
+// from Paystack and returns it to the caller. It must
+// NEVER credit the seller itself — crediting happens in
+// exactly one place: the webhook below. If any frontend
+// code (e.g. an order-success page) currently increments
+// seller balances after calling this endpoint, remove
+// that logic — it is a second source of double-crediting
+// that lives outside this file.
 // =====================================================
 
 app.get("/verify-payment/:reference", async (req, res) => {
@@ -218,9 +243,17 @@ app.get("/verify-payment/:reference", async (req, res) => {
 
 app.post("/paystack-webhook", async (req, res) => {
   try {
+    // ---------------------------------------------------
+    // Verify signature against the RAW bytes Paystack sent,
+    // not a re-serialized copy of the parsed body. Using
+    // JSON.stringify(req.body) can silently produce a
+    // different byte sequence than what was actually POSTed
+    // (number formatting, key handling, etc.), which is
+    // fragile even when it happens to work most of the time.
+    // ---------------------------------------------------
     const hash = crypto
       .createHmac("sha512", PAYSTACK_SECRET)
-      .update(JSON.stringify(req.body))
+      .update(req.rawBody)
       .digest("hex");
 
     const signature = req.headers["x-paystack-signature"];
@@ -229,6 +262,16 @@ app.post("/paystack-webhook", async (req, res) => {
       console.error("Invalid Paystack webhook signature");
       return res.status(401).send("Invalid signature");
     }
+
+    // Acknowledge receipt immediately so Paystack doesn't
+    // treat a slow response as a failure and retry (retries
+    // are the most common cause of the same event arriving
+    // twice). We still process synchronously below since
+    // Firestore writes are fast, but responding early is not
+    // an option here because we need to return an error code
+    // if processing fails — so instead we rely on the atomic
+    // transaction below to make retries safe rather than
+    // trying to outrun Paystack's timeout.
 
     const event = req.body;
 
@@ -251,28 +294,38 @@ app.post("/paystack-webhook", async (req, res) => {
     // -------------------------------------------------
     // PROMOTION PAYMENT
     // Money stays with CampusMart — do NOT credit seller.
-    // Boost is applied by frontend after verify.
+    // Made atomic for the same reason as the order path
+    // below: two near-simultaneous webhook deliveries must
+    // not both write a "not yet recorded" promotion doc.
     // -------------------------------------------------
     if (paymentType === "promotion") {
       const promoPayRef = db.collection("promotionPayments").doc(reference);
-      const existing = await promoPayRef.get();
 
-      if (existing.exists) {
+      const result = await db.runTransaction(async (tx) => {
+        const existing = await tx.get(promoPayRef);
+        if (existing.exists) {
+          return "already-processed";
+        }
+
+        tx.set(promoPayRef, {
+          sellerId: sellerId || null,
+          productIds: metadata.productIds || [],
+          planId: metadata.planId || null,
+          planDays: metadata.planDays || null,
+          totalAmount,
+          paystackReference: reference,
+          productName: metadata.productName || "Promotion",
+          status: "paid",
+          createdAt: FieldValue.serverTimestamp(),
+        });
+
+        return "processed";
+      });
+
+      if (result === "already-processed") {
         console.log(`Promotion ${reference} already recorded.`);
         return res.status(200).send("Already processed");
       }
-
-      await promoPayRef.set({
-        sellerId: sellerId || null,
-        productIds: metadata.productIds || [],
-        planId: metadata.planId || null,
-        planDays: metadata.planDays || null,
-        totalAmount,
-        paystackReference: reference,
-        productName: metadata.productName || "Promotion",
-        status: "paid",
-        createdAt: FieldValue.serverTimestamp(),
-      });
 
       console.log("================================");
       console.log("PROMOTION PAYMENT SUCCESSFUL");
@@ -286,6 +339,16 @@ app.post("/paystack-webhook", async (req, res) => {
 
     // -------------------------------------------------
     // NORMAL ORDER PAYMENT (5% / 95%)
+    //
+    // THE FIX: the "have we already processed this
+    // reference?" check and the "credit the seller" write
+    // now happen inside a single Firestore transaction.
+    // Firestore transactions are atomic and serialized per
+    // document, so if two webhook deliveries for the same
+    // reference race each other, the second one is
+    // guaranteed to see the earnings doc the first one
+    // created and will bail out — instead of both slipping
+    // past the check and crediting the seller twice.
     // -------------------------------------------------
 
     if (!sellerId) {
@@ -297,72 +360,81 @@ app.post("/paystack-webhook", async (req, res) => {
     const sellerAmount = Number((totalAmount * 0.95).toFixed(2));
 
     const earningRef = db.collection("earnings").doc(reference);
-    const existingEarning = await earningRef.get();
-
-    if (existingEarning.exists) {
-      console.log(`Payment ${reference} already processed.`);
-      return res.status(200).send("Already processed");
-    }
-
     const sellerRef = db.collection("users").doc(sellerId);
-    const batch = db.batch();
+    const platformFeeRef = db.collection("platformFees").doc(reference);
+    const orderRef = orderId ? db.collection("orders").doc(orderId) : null;
 
-    batch.set(
-      sellerRef,
-      {
-        availableBalance: FieldValue.increment(sellerAmount),
-        totalEarnings: FieldValue.increment(sellerAmount),
-        totalPlatformFees: FieldValue.increment(platformFee),
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    const result = await db.runTransaction(async (tx) => {
+      // ALL reads must happen before any writes in a
+      // Firestore transaction.
+      const existingEarning = await tx.get(earningRef);
 
-    batch.set(earningRef, {
-      sellerId,
-      orderId: orderId || null,
-      type: "sale",
-      title: orderId
-        ? `Order #${String(orderId).slice(0, 6).toUpperCase()}`
-        : "CampusMart Sale",
-      description: metadata.productName || "Sale",
-      amount: sellerAmount,
-      gross: totalAmount,
-      platformFee,
-      status: "Completed",
-      paystackReference: reference,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+      if (existingEarning.exists) {
+        return "already-processed";
+      }
 
-    batch.set(
-      db.collection("platformFees").doc(reference),
-      {
-        sellerId,
-        orderId: orderId || null,
-        totalAmount,
-        platformFee,
-        sellerAmount,
-        paystackReference: reference,
-        createdAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    if (orderId) {
-      batch.set(
-        db.collection("orders").doc(orderId),
+      tx.set(
+        sellerRef,
         {
-          paymentStatus: "paid",
-          paidAt: FieldValue.serverTimestamp(),
-          paystackReference: reference,
+          availableBalance: FieldValue.increment(sellerAmount),
+          totalEarnings: FieldValue.increment(sellerAmount),
+          totalPlatformFees: FieldValue.increment(platformFee),
           updatedAt: FieldValue.serverTimestamp(),
         },
         { merge: true }
       );
-    }
 
-    await batch.commit();
+      tx.set(earningRef, {
+        sellerId,
+        orderId: orderId || null,
+        type: "sale",
+        title: orderId
+          ? `Order #${String(orderId).slice(0, 6).toUpperCase()}`
+          : "CampusMart Sale",
+        description: metadata.productName || "Sale",
+        amount: sellerAmount,
+        gross: totalAmount,
+        platformFee,
+        status: "Completed",
+        paystackReference: reference,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      tx.set(
+        platformFeeRef,
+        {
+          sellerId,
+          orderId: orderId || null,
+          totalAmount,
+          platformFee,
+          sellerAmount,
+          paystackReference: reference,
+          createdAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (orderRef) {
+        tx.set(
+          orderRef,
+          {
+            paymentStatus: "paid",
+            paidAt: FieldValue.serverTimestamp(),
+            paystackReference: reference,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      return "processed";
+    });
+
+    if (result === "already-processed") {
+      console.log(`Payment ${reference} already processed.`);
+      return res.status(200).send("Already processed");
+    }
 
     console.log("================================");
     console.log("PAYMENT SUCCESSFUL");
@@ -465,38 +537,81 @@ app.post("/process-withdrawal", async (req, res) => {
     }
 
     const sellerRef = db.collection("users").doc(sellerId);
-    const sellerSnap = await sellerRef.get();
 
-    if (!sellerSnap.exists) {
-      return res.status(404).json({ error: "Seller not found" });
-    }
+    // ---------------------------------------------------
+    // Also made atomic: without a transaction, two rapid
+    // withdrawal requests could both read the same
+    // availableBalance before either deducts it, letting a
+    // seller withdraw more than they actually have.
+    // ---------------------------------------------------
+    const deduction = await db.runTransaction(async (tx) => {
+      const sellerSnap = await tx.get(sellerRef);
 
-    const availableBalance = Number(
-      sellerSnap.data().availableBalance || 0
-    );
-
-    if (availableBalance < Number(amount)) {
-      return res.status(400).json({ error: "Insufficient balance" });
-    }
-
-    const recipientRes = await axios.post(
-      "https://api.paystack.co/transferrecipient",
-      {
-        type: "nuban",
-        name: accountName,
-        account_number: accountNumber,
-        bank_code: bankCode,
-        currency: "NGN",
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          "Content-Type": "application/json",
-        },
+      if (!sellerSnap.exists) {
+        throw new Error("SELLER_NOT_FOUND");
       }
-    );
+
+      const availableBalance = Number(
+        sellerSnap.data().availableBalance || 0
+      );
+
+      if (availableBalance < Number(amount)) {
+        throw new Error("INSUFFICIENT_BALANCE");
+      }
+
+      tx.update(sellerRef, {
+        availableBalance: FieldValue.increment(-Number(amount)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return true;
+    }).catch((err) => {
+      if (err.message === "SELLER_NOT_FOUND") {
+        return { error: "Seller not found", status: 404 };
+      }
+      if (err.message === "INSUFFICIENT_BALANCE") {
+        return { error: "Insufficient balance", status: 400 };
+      }
+      throw err;
+    });
+
+    if (deduction && deduction.error) {
+      return res.status(deduction.status).json({ error: deduction.error });
+    }
+
+    let recipientRes;
+    try {
+      recipientRes = await axios.post(
+        "https://api.paystack.co/transferrecipient",
+        {
+          type: "nuban",
+          name: accountName,
+          account_number: accountNumber,
+          bank_code: bankCode,
+          currency: "NGN",
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    } catch (err) {
+      // Refund the deducted balance since the transfer never started
+      await sellerRef.update({
+        availableBalance: FieldValue.increment(Number(amount)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      throw err;
+    }
 
     if (!recipientRes.data.status) {
+      // Refund — recipient creation failed, no transfer was made
+      await sellerRef.update({
+        availableBalance: FieldValue.increment(Number(amount)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
       return res.status(400).json({
         error:
           recipientRes.data.message || "Could not create recipient",
@@ -506,39 +621,45 @@ app.post("/process-withdrawal", async (req, res) => {
     const recipientCode = recipientRes.data.data.recipient_code;
     const transferReference = `WD_${sellerId}_${Date.now()}`;
 
-    const transferRes = await axios.post(
-      "https://api.paystack.co/transfer",
-      {
-        source: "balance",
-        amount: Math.round(Number(amount) * 100),
-        recipient: recipientCode,
-        reason: `CampusMart seller withdrawal - ${sellerId}`,
-        reference: transferReference,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          "Content-Type": "application/json",
+    let transferRes;
+    try {
+      transferRes = await axios.post(
+        "https://api.paystack.co/transfer",
+        {
+          source: "balance",
+          amount: Math.round(Number(amount) * 100),
+          recipient: recipientCode,
+          reason: `CampusMart seller withdrawal - ${sellerId}`,
+          reference: transferReference,
         },
-      }
-    );
+        {
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    } catch (err) {
+      await sellerRef.update({
+        availableBalance: FieldValue.increment(Number(amount)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      throw err;
+    }
 
     if (!transferRes.data.status) {
+      await sellerRef.update({
+        availableBalance: FieldValue.increment(Number(amount)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
       return res.status(400).json({
         error: transferRes.data.message || "Transfer failed",
       });
     }
 
-    const batch = db.batch();
-
-    batch.update(sellerRef, {
-      availableBalance: FieldValue.increment(-Number(amount)),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-
     const withdrawalRef = db.collection("withdrawals").doc();
 
-    batch.set(withdrawalRef, {
+    await withdrawalRef.set({
       sellerId,
       amount: Number(amount),
       bankName: bankName || "",
@@ -551,8 +672,6 @@ app.post("/process-withdrawal", async (req, res) => {
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
-
-    await batch.commit();
 
     return res.json({
       success: true,
