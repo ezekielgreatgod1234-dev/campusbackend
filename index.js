@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 
 const {
   initializeApp,
@@ -28,14 +29,10 @@ app.use(cors());
 // webhook route so we can verify Paystack's signature
 // against the exact bytes they sent (not a re-serialized
 // copy of the parsed JSON, which can mismatch).
-// This must be registered BEFORE express.json() runs
-// for that route, so we use a verify() hook on the
-// json parser itself.
 // =====================================================
 app.use(
   express.json({
     verify: (req, res, buf) => {
-      // Stash the raw bytes on the request for later use
       req.rawBody = buf;
     },
   })
@@ -76,6 +73,85 @@ const FRONTEND_URL =
   "https://campus-mart-ashen.vercel.app";
 
 // =====================================================
+// EMAIL (Nodemailer + SMTP)
+// Env: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM
+// =====================================================
+
+function createMailer() {
+  const host = process.env.SMTP_HOST || "smtp.gmail.com";
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+
+  if (!user || !pass) {
+    console.warn(
+      "SMTP_USER / SMTP_PASS missing — email endpoints will fail until set"
+    );
+  }
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: user && pass ? { user, pass } : undefined,
+  });
+}
+
+const mailer = createMailer();
+
+const MAIL_FROM =
+  process.env.MAIL_FROM ||
+  process.env.SMTP_USER ||
+  "CampusMart <noreply@campusmart.app>";
+
+async function sendMail({ to, subject, html, text }) {
+  if (!to) throw new Error("Missing recipient");
+
+  const info = await mailer.sendMail({
+    from: MAIL_FROM,
+    to,
+    subject,
+    html,
+    text: text || String(html).replace(/<[^>]+>/g, " "),
+  });
+
+  return info;
+}
+
+function emailLayout({ title, bodyHtml }) {
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /></head>
+<body style="margin:0;padding:0;background:#f7faf8;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f7faf8;padding:24px 12px;">
+    <tr><td align="center">
+      <table width="100%" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb;">
+        <tr>
+          <td style="background:#008236;padding:20px 24px;">
+            <div style="color:#fff;font-size:20px;font-weight:800;">Campus<span style="color:#86efac;">Mart</span></div>
+            <div style="color:#d1fae5;font-size:12px;margin-top:4px;">Your Campus Marketplace</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 24px;">
+            <h1 style="margin:0 0 12px;font-size:20px;color:#111827;">${title}</h1>
+            <div style="font-size:14px;line-height:1.6;color:#374151;">${bodyHtml}</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 24px;background:#f9fafb;border-top:1px solid #f3f4f6;font-size:11px;color:#9ca3af;">
+            © CampusMart · You received this because you have a CampusMart account.
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
+// =====================================================
 // HELPER: VERIFY FIREBASE USER
 // =====================================================
 
@@ -90,6 +166,30 @@ async function verifyFirebaseUser(req) {
   const decodedToken = await adminAuth.verifyIdToken(idToken);
 
   return decodedToken;
+}
+
+async function requireAdmin(req) {
+  const decoded = await verifyFirebaseUser(req);
+  const adminEmail = (decoded.email || "").toLowerCase();
+  const isMainAdmin = adminEmail === "campusmart1234@gmail.com";
+
+  let isAdmin = isMainAdmin;
+  if (!isAdmin) {
+    const userDoc = await db.collection("users").doc(decoded.uid).get();
+    const data = userDoc.exists ? userDoc.data() : {};
+    isAdmin =
+      data.role === "admin" ||
+      data.isAdmin === true ||
+      (Array.isArray(data.roles) && data.roles.includes("admin"));
+  }
+
+  if (!isAdmin) {
+    const err = new Error("Admin only");
+    err.status = 403;
+    throw err;
+  }
+
+  return decoded;
 }
 
 // =====================================================
@@ -127,8 +227,6 @@ app.post("/initialize-payment", async (req, res) => {
 
     const paymentType = type === "promotion" ? "promotion" : "order";
 
-    // Promotion → return to promotions page
-    // Order → existing order-success page
     const finalCallback =
       callback_url ||
       (paymentType === "promotion"
@@ -170,7 +268,6 @@ app.post("/initialize-payment", async (req, res) => {
     const authUrl = response.data.data.authorization_url;
     const reference = response.data.data.reference;
 
-    // Support both shapes used by frontend
     return res.json({
       success: true,
       authorization_url: authUrl,
@@ -194,15 +291,7 @@ app.post("/initialize-payment", async (req, res) => {
 });
 
 // =====================================================
-// 1b. VERIFY PAYMENT
-// This endpoint only ever READS the transaction status
-// from Paystack and returns it to the caller. It must
-// NEVER credit the seller itself — crediting happens in
-// exactly one place: the webhook below. If any frontend
-// code (e.g. an order-success page) currently increments
-// seller balances after calling this endpoint, remove
-// that logic — it is a second source of double-crediting
-// that lives outside this file.
+// 1b. VERIFY PAYMENT (read-only — never credits seller)
 // =====================================================
 
 app.get("/verify-payment/:reference", async (req, res) => {
@@ -243,14 +332,6 @@ app.get("/verify-payment/:reference", async (req, res) => {
 
 app.post("/paystack-webhook", async (req, res) => {
   try {
-    // ---------------------------------------------------
-    // Verify signature against the RAW bytes Paystack sent,
-    // not a re-serialized copy of the parsed body. Using
-    // JSON.stringify(req.body) can silently produce a
-    // different byte sequence than what was actually POSTed
-    // (number formatting, key handling, etc.), which is
-    // fragile even when it happens to work most of the time.
-    // ---------------------------------------------------
     const hash = crypto
       .createHmac("sha512", PAYSTACK_SECRET)
       .update(req.rawBody)
@@ -262,16 +343,6 @@ app.post("/paystack-webhook", async (req, res) => {
       console.error("Invalid Paystack webhook signature");
       return res.status(401).send("Invalid signature");
     }
-
-    // Acknowledge receipt immediately so Paystack doesn't
-    // treat a slow response as a failure and retry (retries
-    // are the most common cause of the same event arriving
-    // twice). We still process synchronously below since
-    // Firestore writes are fast, but responding early is not
-    // an option here because we need to return an error code
-    // if processing fails — so instead we rely on the atomic
-    // transaction below to make retries safe rather than
-    // trying to outrun Paystack's timeout.
 
     const event = req.body;
 
@@ -293,10 +364,6 @@ app.post("/paystack-webhook", async (req, res) => {
 
     // -------------------------------------------------
     // PROMOTION PAYMENT
-    // Money stays with CampusMart — do NOT credit seller.
-    // Made atomic for the same reason as the order path
-    // below: two near-simultaneous webhook deliveries must
-    // not both write a "not yet recorded" promotion doc.
     // -------------------------------------------------
     if (paymentType === "promotion") {
       const promoPayRef = db.collection("promotionPayments").doc(reference);
@@ -327,28 +394,12 @@ app.post("/paystack-webhook", async (req, res) => {
         return res.status(200).send("Already processed");
       }
 
-      console.log("================================");
-      console.log("PROMOTION PAYMENT SUCCESSFUL");
-      console.log(`Reference: ${reference}`);
-      console.log(`Seller: ${sellerId}`);
-      console.log(`Amount (platform): ₦${totalAmount}`);
-      console.log("================================");
-
+      console.log("PROMOTION PAYMENT SUCCESSFUL", reference, sellerId, totalAmount);
       return res.status(200).send("OK");
     }
 
     // -------------------------------------------------
     // NORMAL ORDER PAYMENT (5% / 95%)
-    //
-    // THE FIX: the "have we already processed this
-    // reference?" check and the "credit the seller" write
-    // now happen inside a single Firestore transaction.
-    // Firestore transactions are atomic and serialized per
-    // document, so if two webhook deliveries for the same
-    // reference race each other, the second one is
-    // guaranteed to see the earnings doc the first one
-    // created and will bail out — instead of both slipping
-    // past the check and crediting the seller twice.
     // -------------------------------------------------
 
     if (!sellerId) {
@@ -365,8 +416,6 @@ app.post("/paystack-webhook", async (req, res) => {
     const orderRef = orderId ? db.collection("orders").doc(orderId) : null;
 
     const result = await db.runTransaction(async (tx) => {
-      // ALL reads must happen before any writes in a
-      // Firestore transaction.
       const existingEarning = await tx.get(earningRef);
 
       if (existingEarning.exists) {
@@ -436,15 +485,7 @@ app.post("/paystack-webhook", async (req, res) => {
       return res.status(200).send("Already processed");
     }
 
-    console.log("================================");
-    console.log("PAYMENT SUCCESSFUL");
-    console.log(`Reference: ${reference}`);
-    console.log(`Seller: ${sellerId}`);
-    console.log(`Gross: ₦${totalAmount}`);
-    console.log(`Platform fee: ₦${platformFee}`);
-    console.log(`Seller receives: ₦${sellerAmount}`);
-    console.log("================================");
-
+    console.log("PAYMENT SUCCESSFUL", reference, sellerId, totalAmount, sellerAmount);
     return res.status(200).send("OK");
   } catch (error) {
     console.error("Paystack webhook error:", error);
@@ -538,42 +579,38 @@ app.post("/process-withdrawal", async (req, res) => {
 
     const sellerRef = db.collection("users").doc(sellerId);
 
-    // ---------------------------------------------------
-    // Also made atomic: without a transaction, two rapid
-    // withdrawal requests could both read the same
-    // availableBalance before either deducts it, letting a
-    // seller withdraw more than they actually have.
-    // ---------------------------------------------------
-    const deduction = await db.runTransaction(async (tx) => {
-      const sellerSnap = await tx.get(sellerRef);
+    const deduction = await db
+      .runTransaction(async (tx) => {
+        const sellerSnap = await tx.get(sellerRef);
 
-      if (!sellerSnap.exists) {
-        throw new Error("SELLER_NOT_FOUND");
-      }
+        if (!sellerSnap.exists) {
+          throw new Error("SELLER_NOT_FOUND");
+        }
 
-      const availableBalance = Number(
-        sellerSnap.data().availableBalance || 0
-      );
+        const availableBalance = Number(
+          sellerSnap.data().availableBalance || 0
+        );
 
-      if (availableBalance < Number(amount)) {
-        throw new Error("INSUFFICIENT_BALANCE");
-      }
+        if (availableBalance < Number(amount)) {
+          throw new Error("INSUFFICIENT_BALANCE");
+        }
 
-      tx.update(sellerRef, {
-        availableBalance: FieldValue.increment(-Number(amount)),
-        updatedAt: FieldValue.serverTimestamp(),
+        tx.update(sellerRef, {
+          availableBalance: FieldValue.increment(-Number(amount)),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        return true;
+      })
+      .catch((err) => {
+        if (err.message === "SELLER_NOT_FOUND") {
+          return { error: "Seller not found", status: 404 };
+        }
+        if (err.message === "INSUFFICIENT_BALANCE") {
+          return { error: "Insufficient balance", status: 400 };
+        }
+        throw err;
       });
-
-      return true;
-    }).catch((err) => {
-      if (err.message === "SELLER_NOT_FOUND") {
-        return { error: "Seller not found", status: 404 };
-      }
-      if (err.message === "INSUFFICIENT_BALANCE") {
-        return { error: "Insufficient balance", status: 400 };
-      }
-      throw err;
-    });
 
     if (deduction && deduction.error) {
       return res.status(deduction.status).json({ error: deduction.error });
@@ -598,7 +635,6 @@ app.post("/process-withdrawal", async (req, res) => {
         }
       );
     } catch (err) {
-      // Refund the deducted balance since the transfer never started
       await sellerRef.update({
         availableBalance: FieldValue.increment(Number(amount)),
         updatedAt: FieldValue.serverTimestamp(),
@@ -607,7 +643,6 @@ app.post("/process-withdrawal", async (req, res) => {
     }
 
     if (!recipientRes.data.status) {
-      // Refund — recipient creation failed, no transfer was made
       await sellerRef.update({
         availableBalance: FieldValue.increment(Number(amount)),
         updatedAt: FieldValue.serverTimestamp(),
@@ -726,7 +761,6 @@ app.post("/process-platform-withdrawal", async (req, res) => {
       totalFees += Number(d.data().platformFee) || 0;
     });
 
-    // Include promotion payments as platform income
     const promoSnap = await db.collection("promotionPayments").get();
     promoSnap.forEach((d) => {
       totalFees += Number(d.data().totalAmount) || 0;
@@ -828,6 +862,185 @@ app.post("/process-platform-withdrawal", async (req, res) => {
       error:
         error.response?.data?.message ||
         "Could not process platform withdrawal",
+    });
+  }
+});
+
+// =====================================================
+// 6. WELCOME EMAIL (new registration)
+// POST /send-welcome-email
+// Body: { email, fullName }
+// =====================================================
+
+app.post("/send-welcome-email", async (req, res) => {
+  try {
+    const { email, fullName } = req.body || {};
+
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
+
+    let title = "Welcome to CampusMart 👋";
+    let body =
+      "Thanks for joining CampusMart! Browse products, chat sellers, and enjoy secure campus shopping.";
+    let enabled = true;
+
+    try {
+      const snap = await db.collection("settings").doc("welcomeMessage").get();
+      if (snap.exists) {
+        const w = snap.data() || {};
+        if (w.enabled === false) enabled = false;
+        if (w.title) title = String(w.title);
+        if (w.body) body = String(w.body);
+      }
+    } catch (e) {
+      console.warn("welcome settings:", e.message);
+    }
+
+    if (!enabled) {
+      return res.json({
+        success: true,
+        skipped: true,
+        message: "Welcome emails disabled",
+      });
+    }
+
+    const name = (fullName || "").trim().split(/\s+/)[0] || "there";
+    const finalTitle = title.replace(/\{name\}/g, name);
+    const finalBody = body.replace(/\{name\}/g, name);
+    const bodyHtml = finalBody
+      .split("\n")
+      .map((line) => `<p style="margin:0 0 10px;">${line}</p>`)
+      .join("");
+
+    await sendMail({
+      to: String(email).trim().toLowerCase(),
+      subject: finalTitle,
+      html: emailLayout({ title: finalTitle, bodyHtml }),
+    });
+
+    return res.json({ success: true, message: "Welcome email sent" });
+  } catch (error) {
+    console.error("Welcome email error:", error);
+    return res.status(500).json({
+      error: error.message || "Could not send welcome email",
+    });
+  }
+});
+
+// =====================================================
+// 7. ANNOUNCEMENT EMAIL (admin)
+// POST /send-announcement-email
+// Headers: Authorization: Bearer <Firebase ID token>
+// Body: { title, body, mode: "all" | "single", email? }
+// =====================================================
+
+app.post("/send-announcement-email", async (req, res) => {
+  try {
+    let decoded;
+    try {
+      decoded = await requireAdmin(req);
+    } catch (e) {
+      const status = e.status || 401;
+      return res.status(status).json({
+        error: e.message || "Unauthorized",
+      });
+    }
+
+    const { title, body, mode, email } = req.body || {};
+
+    if (!title || !body) {
+      return res.status(400).json({
+        error: "title and body are required",
+      });
+    }
+
+    const bodyHtml = String(body)
+      .split("\n")
+      .map((line) => `<p style="margin:0 0 10px;">${line}</p>`)
+      .join("");
+    const html = emailLayout({
+      title: String(title),
+      bodyHtml,
+    });
+
+    // ---- single email ----
+    if (mode === "single") {
+      if (!email) {
+        return res.status(400).json({
+          error: "email is required for single mode",
+        });
+      }
+
+      await sendMail({
+        to: String(email).trim().toLowerCase(),
+        subject: String(title),
+        html,
+      });
+
+      await db.collection("announcements").add({
+        title: String(title),
+        body: String(body),
+        audience: "single",
+        targetEmail: String(email).trim().toLowerCase(),
+        type: "email",
+        active: true,
+        createdBy: decoded.uid,
+        createdByEmail: decoded.email || null,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      return res.json({ success: true, sent: 1, mode: "single" });
+    }
+
+    // ---- all registered emails ----
+    const snap = await db.collection("users").get();
+    const emails = [];
+    snap.forEach((docSnap) => {
+      const d = docSnap.data() || {};
+      const e = (d.email || "").trim().toLowerCase();
+      if (e && e.includes("@")) emails.push(e);
+    });
+
+    const unique = [...new Set(emails)];
+    let sent = 0;
+    let failed = 0;
+
+    for (const to of unique) {
+      try {
+        await sendMail({ to, subject: String(title), html });
+        sent += 1;
+        await new Promise((r) => setTimeout(r, 200));
+      } catch (err) {
+        console.error("Failed to", to, err.message);
+        failed += 1;
+      }
+    }
+
+    await db.collection("announcements").add({
+      title: String(title),
+      body: String(body),
+      audience: "all",
+      type: "email",
+      active: true,
+      sentCount: sent,
+      failedCount: failed,
+      createdBy: decoded.uid,
+      createdByEmail: decoded.email || null,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return res.json({
+      success: true,
+      mode: "all",
+      total: unique.length,
+      sent,
+      failed,
+    });
+  } catch (error) {
+    console.error("Announcement email error:", error);
+    return res.status(500).json({
+      error: error.message || "Could not send announcement emails",
     });
   }
 });
