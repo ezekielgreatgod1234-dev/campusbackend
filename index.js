@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const crypto = require("crypto");
-const nodemailer = require("nodemailer");
 
 const {
   initializeApp,
@@ -24,12 +23,6 @@ const app = express();
 
 app.use(cors());
 
-// =====================================================
-// IMPORTANT: capture the RAW request body for the
-// webhook route so we can verify Paystack's signature
-// against the exact bytes they sent (not a re-serialized
-// copy of the parsed JSON, which can mismatch).
-// =====================================================
 app.use(
   express.json({
     verify: (req, res, buf) => {
@@ -73,49 +66,46 @@ const FRONTEND_URL =
   "https://campus-mart-ashen.vercel.app";
 
 // =====================================================
-// EMAIL (Nodemailer + SMTP)
-// Env: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM
+// EMAIL (Brevo)
 // =====================================================
 
-function createMailer() {
-  const host = process.env.SMTP_HOST || "smtp.gmail.com";
-  const port = Number(process.env.SMTP_PORT || 587);
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-
-  if (!user || !pass) {
-    console.warn(
-      "SMTP_USER / SMTP_PASS missing — email endpoints will fail until set"
-    );
-  }
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: user && pass ? { user, pass } : undefined,
-  });
-}
-
-const mailer = createMailer();
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
 const MAIL_FROM =
-  process.env.MAIL_FROM ||
-  process.env.SMTP_USER ||
-  "CampusMart <noreply@campusmart.app>";
+  process.env.MAIL_FROM || "noreply@campusmart.app";
+
+const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || "CampusMart";
+
+if (!BREVO_API_KEY) {
+  console.warn(
+    "BREVO_API_KEY missing — email endpoints will fail until it's set"
+  );
+}
 
 async function sendMail({ to, subject, html, text }) {
   if (!to) throw new Error("Missing recipient");
+  if (!BREVO_API_KEY) throw new Error("Email provider not configured (missing BREVO_API_KEY)");
 
-  const info = await mailer.sendMail({
-    from: MAIL_FROM,
-    to,
-    subject,
-    html,
-    text: text || String(html).replace(/<[^>]+>/g, " "),
-  });
+  const response = await axios.post(
+    "https://api.brevo.com/v3/smtp/email",
+    {
+      sender: { name: MAIL_FROM_NAME, email: MAIL_FROM },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+      textContent: text || String(html).replace(/<[^>]+>/g, " "),
+    },
+    {
+      headers: {
+        "api-key": BREVO_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      timeout: 15000,
+    }
+  );
 
-  return info;
+  return response.data;
 }
 
 function emailLayout({ title, bodyHtml }) {
@@ -152,7 +142,7 @@ function emailLayout({ title, bodyHtml }) {
 }
 
 // =====================================================
-// HELPER: VERIFY FIREBASE USER
+// HELPERS
 // =====================================================
 
 async function verifyFirebaseUser(req) {
@@ -204,7 +194,7 @@ app.post("/initialize-payment", async (req, res) => {
       sellerId,
       orderId,
       productName,
-      type, // "order" | "promotion"
+      type,
       productIds,
       planId,
       planDays,
@@ -291,7 +281,7 @@ app.post("/initialize-payment", async (req, res) => {
 });
 
 // =====================================================
-// 1b. VERIFY PAYMENT (read-only — never credits seller)
+// 1b. VERIFY PAYMENT
 // =====================================================
 
 app.get("/verify-payment/:reference", async (req, res) => {
@@ -399,7 +389,7 @@ app.post("/paystack-webhook", async (req, res) => {
     }
 
     // -------------------------------------------------
-    // NORMAL ORDER PAYMENT (5% / 95%)
+    // NORMAL ORDER PAYMENT — 100% to seller
     // -------------------------------------------------
 
     if (!sellerId) {
@@ -407,8 +397,8 @@ app.post("/paystack-webhook", async (req, res) => {
       return res.status(200).send("OK");
     }
 
-    const platformFee = Number((totalAmount * 0.05).toFixed(2));
-    const sellerAmount = Number((totalAmount * 0.95).toFixed(2));
+    const platformFee = 0;
+    const sellerAmount = Number(totalAmount.toFixed(2));
 
     const earningRef = db.collection("earnings").doc(reference);
     const sellerRef = db.collection("users").doc(sellerId);
@@ -867,9 +857,7 @@ app.post("/process-platform-withdrawal", async (req, res) => {
 });
 
 // =====================================================
-// 6. WELCOME EMAIL (new registration)
-// POST /send-welcome-email
-// Body: { email, fullName }
+// 6. WELCOME EMAIL
 // =====================================================
 
 app.post("/send-welcome-email", async (req, res) => {
@@ -913,13 +901,22 @@ app.post("/send-welcome-email", async (req, res) => {
       .map((line) => `<p style="margin:0 0 10px;">${line}</p>`)
       .join("");
 
-    await sendMail({
-      to: String(email).trim().toLowerCase(),
-      subject: finalTitle,
-      html: emailLayout({ title: finalTitle, bodyHtml }),
-    });
+    try {
+      await sendMail({
+        to: String(email).trim().toLowerCase(),
+        subject: finalTitle,
+        html: emailLayout({ title: finalTitle, bodyHtml }),
+      });
+    } catch (mailErr) {
+      console.error("Welcome email send failed:", mailErr.response?.data || mailErr.message);
+      return res.json({
+        success: true,
+        emailSent: false,
+        message: "Account created, but welcome email could not be sent",
+      });
+    }
 
-    return res.json({ success: true, message: "Welcome email sent" });
+    return res.json({ success: true, emailSent: true, message: "Welcome email sent" });
   } catch (error) {
     console.error("Welcome email error:", error);
     return res.status(500).json({
@@ -929,10 +926,7 @@ app.post("/send-welcome-email", async (req, res) => {
 });
 
 // =====================================================
-// 7. ANNOUNCEMENT EMAIL (admin)
-// POST /send-announcement-email
-// Headers: Authorization: Bearer <Firebase ID token>
-// Body: { title, body, mode: "all" | "single", email? }
+// 7. ANNOUNCEMENT EMAIL
 // =====================================================
 
 app.post("/send-announcement-email", async (req, res) => {
@@ -964,7 +958,6 @@ app.post("/send-announcement-email", async (req, res) => {
       bodyHtml,
     });
 
-    // ---- single email ----
     if (mode === "single") {
       if (!email) {
         return res.status(400).json({
@@ -993,7 +986,6 @@ app.post("/send-announcement-email", async (req, res) => {
       return res.json({ success: true, sent: 1, mode: "single" });
     }
 
-    // ---- all registered emails ----
     const snap = await db.collection("users").get();
     const emails = [];
     snap.forEach((docSnap) => {
@@ -1012,7 +1004,7 @@ app.post("/send-announcement-email", async (req, res) => {
         sent += 1;
         await new Promise((r) => setTimeout(r, 200));
       } catch (err) {
-        console.error("Failed to", to, err.message);
+        console.error("Failed to", to, err.response?.data || err.message);
         failed += 1;
       }
     }
