@@ -84,7 +84,9 @@ if (!BREVO_API_KEY) {
 
 async function sendMail({ to, subject, html, text }) {
   if (!to) throw new Error("Missing recipient");
-  if (!BREVO_API_KEY) throw new Error("Email provider not configured (missing BREVO_API_KEY)");
+  if (!BREVO_API_KEY) {
+    throw new Error("Email provider not configured (missing BREVO_API_KEY)");
+  }
 
   const response = await axios.post(
     "https://api.brevo.com/v3/smtp/email",
@@ -180,6 +182,34 @@ async function requireAdmin(req) {
   }
 
   return decoded;
+}
+
+/**
+ * Activate sliding in-app banner so logged-in users
+ * are told to check email (inbox + Junk/Spam).
+ */
+async function activateLiveBanner({
+  announcementId,
+  title,
+  body,
+  createdBy,
+  createdByEmail,
+}) {
+  await db.collection("settings").doc("liveBanner").set(
+    {
+      active: true,
+      announcementId: announcementId || null,
+      title: title || "CampusMart Announcement",
+      body: body || "",
+      bannerMessage:
+        "We've sent an announcement to your email. Please also check your Junk / Spam folder if you don't see it in your inbox.",
+      createdBy: createdBy || null,
+      createdByEmail: createdByEmail || null,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
 }
 
 // =====================================================
@@ -352,9 +382,6 @@ app.post("/paystack-webhook", async (req, res) => {
       return res.status(200).send("OK");
     }
 
-    // -------------------------------------------------
-    // PROMOTION PAYMENT
-    // -------------------------------------------------
     if (paymentType === "promotion") {
       const promoPayRef = db.collection("promotionPayments").doc(reference);
 
@@ -387,10 +414,6 @@ app.post("/paystack-webhook", async (req, res) => {
       console.log("PROMOTION PAYMENT SUCCESSFUL", reference, sellerId, totalAmount);
       return res.status(200).send("OK");
     }
-
-    // -------------------------------------------------
-    // NORMAL ORDER PAYMENT — 100% to seller
-    // -------------------------------------------------
 
     if (!sellerId) {
       console.warn("Payment has no sellerId:", reference);
@@ -908,7 +931,10 @@ app.post("/send-welcome-email", async (req, res) => {
         html: emailLayout({ title: finalTitle, bodyHtml }),
       });
     } catch (mailErr) {
-      console.error("Welcome email send failed:", mailErr.response?.data || mailErr.message);
+      console.error(
+        "Welcome email send failed:",
+        mailErr.response?.data || mailErr.message
+      );
       return res.json({
         success: true,
         emailSent: false,
@@ -916,7 +942,11 @@ app.post("/send-welcome-email", async (req, res) => {
       });
     }
 
-    return res.json({ success: true, emailSent: true, message: "Welcome email sent" });
+    return res.json({
+      success: true,
+      emailSent: true,
+      message: "Welcome email sent",
+    });
   } catch (error) {
     console.error("Welcome email error:", error);
     return res.status(500).json({
@@ -926,7 +956,7 @@ app.post("/send-welcome-email", async (req, res) => {
 });
 
 // =====================================================
-// 7. ANNOUNCEMENT EMAIL
+// 7. ANNOUNCEMENT EMAIL + LIVE BANNER
 // =====================================================
 
 app.post("/send-announcement-email", async (req, res) => {
@@ -941,7 +971,13 @@ app.post("/send-announcement-email", async (req, res) => {
       });
     }
 
-    const { title, body, mode, email } = req.body || {};
+    const {
+      title,
+      body,
+      mode,
+      email,
+      showBanner = true,
+    } = req.body || {};
 
     if (!title || !body) {
       return res.status(400).json({
@@ -953,11 +989,13 @@ app.post("/send-announcement-email", async (req, res) => {
       .split("\n")
       .map((line) => `<p style="margin:0 0 10px;">${line}</p>`)
       .join("");
+
     const html = emailLayout({
       title: String(title),
       bodyHtml,
     });
 
+    // ---- single email ----
     if (mode === "single") {
       if (!email) {
         return res.status(400).json({
@@ -971,21 +1009,39 @@ app.post("/send-announcement-email", async (req, res) => {
         html,
       });
 
-      await db.collection("announcements").add({
+      const annRef = await db.collection("announcements").add({
         title: String(title),
         body: String(body),
         audience: "single",
         targetEmail: String(email).trim().toLowerCase(),
         type: "email",
         active: true,
+        showBanner: !!showBanner,
         createdBy: decoded.uid,
         createdByEmail: decoded.email || null,
         createdAt: FieldValue.serverTimestamp(),
       });
 
-      return res.json({ success: true, sent: 1, mode: "single" });
+      if (showBanner) {
+        await activateLiveBanner({
+          announcementId: annRef.id,
+          title: String(title),
+          body: String(body),
+          createdBy: decoded.uid,
+          createdByEmail: decoded.email || null,
+        });
+      }
+
+      return res.json({
+        success: true,
+        sent: 1,
+        mode: "single",
+        bannerActive: !!showBanner,
+        announcementId: annRef.id,
+      });
     }
 
+    // ---- all registered emails ----
     const snap = await db.collection("users").get();
     const emails = [];
     snap.forEach((docSnap) => {
@@ -1004,17 +1060,22 @@ app.post("/send-announcement-email", async (req, res) => {
         sent += 1;
         await new Promise((r) => setTimeout(r, 200));
       } catch (err) {
-        console.error("Failed to", to, err.response?.data || err.message);
+        console.error(
+          "Failed to",
+          to,
+          err.response?.data || err.message
+        );
         failed += 1;
       }
     }
 
-    await db.collection("announcements").add({
+    const annRef = await db.collection("announcements").add({
       title: String(title),
       body: String(body),
       audience: "all",
       type: "email",
       active: true,
+      showBanner: !!showBanner,
       sentCount: sent,
       failedCount: failed,
       createdBy: decoded.uid,
@@ -1022,17 +1083,54 @@ app.post("/send-announcement-email", async (req, res) => {
       createdAt: FieldValue.serverTimestamp(),
     });
 
+    if (showBanner) {
+      await activateLiveBanner({
+        announcementId: annRef.id,
+        title: String(title),
+        body: String(body),
+        createdBy: decoded.uid,
+        createdByEmail: decoded.email || null,
+      });
+    }
+
     return res.json({
       success: true,
       mode: "all",
       total: unique.length,
       sent,
       failed,
+      bannerActive: !!showBanner,
+      announcementId: annRef.id,
     });
   } catch (error) {
     console.error("Announcement email error:", error);
     return res.status(500).json({
       error: error.message || "Could not send announcement emails",
+    });
+  }
+});
+
+// =====================================================
+// 8. CLEAR LIVE BANNER (admin)
+// =====================================================
+
+app.post("/clear-live-banner", async (req, res) => {
+  try {
+    await requireAdmin(req);
+
+    await db.collection("settings").doc("liveBanner").set(
+      {
+        active: false,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({ success: true, message: "Banner cleared" });
+  } catch (error) {
+    const status = error.status || 500;
+    return res.status(status).json({
+      error: error.message || "Could not clear banner",
     });
   }
 });
