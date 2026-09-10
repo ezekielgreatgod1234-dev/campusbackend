@@ -628,22 +628,17 @@ async function publishPrivateTicker({
   createdByEmail,
 }) {
   if (!targetUid) {
-    throw new Error(
-      "targetUid is required"
-    );
+    throw new Error("targetUid is required");
   }
 
-  if (!message) {
-    throw new Error(
-      "message is required"
-    );
+  const cleanMessage = String(message || "").trim();
+
+  if (!cleanMessage) {
+    throw new Error("message is required");
   }
 
-  /*
-   * IMPORTANT:
-   *
-   * The document ID is the REAL Firebase Authentication UID.
-   */
+  // IMPORTANT:
+  // targetUid MUST be the REAL Firebase Authentication UID.
   await db
     .collection("userTickers")
     .doc(targetUid)
@@ -651,16 +646,13 @@ async function publishPrivateTicker({
       {
         active: true,
 
-        message:
-          String(message).trim(),
+        message: cleanMessage,
 
-        targetType:
-          "single",
+        targetType: "single",
 
         targetUid,
 
-        targetEmail:
-          targetEmail || null,
+        targetEmail: targetEmail || null,
 
         updatedAt:
           FieldValue.serverTimestamp(),
@@ -676,6 +668,758 @@ async function publishPrivateTicker({
       }
     );
 }
+
+
+// =====================================================
+// ADMIN: PUBLISH TICKER
+// =====================================================
+//
+// This is the main endpoint used by AdminDashboard.
+//
+// mode:
+//   "all"    -> everyone
+//   "single" -> one Firebase account
+//
+// For single mode, email is resolved through Firebase
+// Authentication to obtain the REAL Firebase UID.
+// =====================================================
+
+app.post(
+  "/admin/publish-ticker",
+  async (req, res) => {
+    try {
+      const decoded =
+        await requireAdmin(req);
+
+      const {
+        mode,
+        email,
+        message,
+      } = req.body || {};
+
+      const cleanMode =
+        String(mode || "all")
+          .trim()
+          .toLowerCase();
+
+      const cleanMessage =
+        String(message || "").trim();
+
+      if (!cleanMessage) {
+        return res.status(400).json({
+          error:
+            "message is required",
+        });
+      }
+
+      // -------------------------------------------------
+      // GLOBAL TICKER
+      // -------------------------------------------------
+
+      if (cleanMode === "all") {
+        await db
+          .collection("settings")
+          .doc("liveTicker")
+          .set(
+            {
+              active: true,
+
+              message:
+                cleanMessage,
+
+              targetType:
+                "all",
+
+              updatedAt:
+                FieldValue.serverTimestamp(),
+
+              createdBy:
+                decoded.uid,
+
+              createdByEmail:
+                decoded.email ||
+                null,
+            },
+            {
+              merge: true,
+            }
+          );
+
+        console.log(
+          "GLOBAL TICKER PUBLISHED",
+          {
+            message:
+              cleanMessage,
+
+            createdBy:
+              decoded.email ||
+              decoded.uid,
+          }
+        );
+
+        return res.json({
+          success: true,
+
+          mode: "all",
+
+          message:
+            "Global ticker published successfully.",
+        });
+      }
+
+      // -------------------------------------------------
+      // SINGLE USER TICKER
+      // -------------------------------------------------
+
+      if (cleanMode === "single") {
+        if (!email) {
+          return res.status(400).json({
+            error:
+              "email is required for single mode",
+          });
+        }
+
+        const normalizedEmail =
+          String(email)
+            .trim()
+            .toLowerCase();
+
+        /*
+         * CRITICAL:
+         *
+         * Never use:
+         *
+         * users/{documentId}
+         *
+         * as the Firebase UID.
+         *
+         * Firebase Authentication is the source of truth.
+         */
+        const userRecord =
+          await findFirebaseUserByEmail(
+            normalizedEmail
+          );
+
+        if (userRecord.disabled) {
+          return res.status(400).json({
+            error:
+              "This Firebase account is disabled.",
+          });
+        }
+
+        // Write using the REAL Firebase Auth UID.
+        await publishPrivateTicker({
+          targetUid:
+            userRecord.uid,
+
+          targetEmail:
+            userRecord.email ||
+            normalizedEmail,
+
+          message:
+            cleanMessage,
+
+          createdBy:
+            decoded.uid,
+
+          createdByEmail:
+            decoded.email ||
+            null,
+        });
+
+        console.log(
+          "PRIVATE TICKER PUBLISHED",
+          {
+            targetEmail:
+              userRecord.email ||
+              normalizedEmail,
+
+            targetUid:
+              userRecord.uid,
+
+            createdBy:
+              decoded.email ||
+              decoded.uid,
+          }
+        );
+
+        return res.json({
+          success: true,
+
+          mode: "single",
+
+          targetUid:
+            userRecord.uid,
+
+          targetEmail:
+            userRecord.email ||
+            normalizedEmail,
+
+          message:
+            "Private ticker sent successfully.",
+        });
+      }
+
+      return res.status(400).json({
+        error:
+          'mode must be either "all" or "single"',
+      });
+    } catch (error) {
+      console.error(
+        "Publish ticker error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not publish ticker",
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// ADMIN: CLEAR TICKER
+// =====================================================
+//
+// Main endpoint used by AdminDashboard.
+//
+// mode:
+//   "all"    -> clear global ticker
+//   "single" -> clear one user's ticker
+// =====================================================
+
+app.post(
+  "/admin/clear-ticker",
+  async (req, res) => {
+    try {
+      const decoded =
+        await requireAdmin(req);
+
+      const {
+        mode,
+        email,
+      } = req.body || {};
+
+      const cleanMode =
+        String(mode || "all")
+          .trim()
+          .toLowerCase();
+
+      // -------------------------------------------------
+      // CLEAR GLOBAL TICKER
+      // -------------------------------------------------
+
+      if (cleanMode === "all") {
+        await db
+          .collection("settings")
+          .doc("liveTicker")
+          .set(
+            {
+              active: false,
+
+              updatedAt:
+                FieldValue.serverTimestamp(),
+
+              clearedBy:
+                decoded.uid,
+
+              clearedByEmail:
+                decoded.email ||
+                null,
+            },
+            {
+              merge: true,
+            }
+          );
+
+        console.log(
+          "GLOBAL TICKER CLEARED"
+        );
+
+        return res.json({
+          success: true,
+
+          mode: "all",
+
+          message:
+            "Global ticker cleared.",
+        });
+      }
+
+      // -------------------------------------------------
+      // CLEAR PRIVATE TICKER
+      // -------------------------------------------------
+
+      if (cleanMode === "single") {
+        if (!email) {
+          return res.status(400).json({
+            error:
+              "email is required for single mode",
+          });
+        }
+
+        const normalizedEmail =
+          String(email)
+            .trim()
+            .toLowerCase();
+
+        // Resolve REAL Firebase Auth UID.
+        const userRecord =
+          await findFirebaseUserByEmail(
+            normalizedEmail
+          );
+
+        await db
+          .collection("userTickers")
+          .doc(userRecord.uid)
+          .set(
+            {
+              active: false,
+
+              updatedAt:
+                FieldValue.serverTimestamp(),
+
+              clearedBy:
+                decoded.uid,
+
+              clearedByEmail:
+                decoded.email ||
+                null,
+            },
+            {
+              merge: true,
+            }
+          );
+
+        console.log(
+          "PRIVATE TICKER CLEARED",
+          {
+            targetUid:
+              userRecord.uid,
+
+            targetEmail:
+              userRecord.email ||
+              normalizedEmail,
+          }
+        );
+
+        return res.json({
+          success: true,
+
+          mode: "single",
+
+          targetUid:
+            userRecord.uid,
+
+          targetEmail:
+            userRecord.email ||
+            normalizedEmail,
+
+          message:
+            "Private ticker cleared.",
+        });
+      }
+
+      return res.status(400).json({
+        error:
+          'mode must be either "all" or "single"',
+      });
+    } catch (error) {
+      console.error(
+        "Clear ticker error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not clear ticker",
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// ADMIN: LOOK UP FIREBASE AUTH USER
+// =====================================================
+
+app.get(
+  "/admin/lookup-user",
+  async (req, res) => {
+    try {
+      await requireAdmin(req);
+
+      const email =
+        String(
+          req.query.email || ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (!email) {
+        return res.status(400).json({
+          error:
+            "email is required",
+        });
+      }
+
+      const userRecord =
+        await findFirebaseUserByEmail(
+          email
+        );
+
+      return res.json({
+        success: true,
+
+        uid:
+          userRecord.uid,
+
+        email:
+          userRecord.email ||
+          email,
+
+        displayName:
+          userRecord.displayName ||
+          "",
+
+        disabled:
+          !!userRecord.disabled,
+      });
+    } catch (error) {
+      console.error(
+        "Admin user lookup error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not find user",
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// OLD PRIVATE TICKER ENDPOINT
+// =====================================================
+//
+// Kept for compatibility with your previous frontend.
+// =====================================================
+
+app.post(
+  "/admin/private-ticker",
+  async (req, res) => {
+    try {
+      const decoded =
+        await requireAdmin(req);
+
+      const {
+        email,
+        message,
+      } = req.body || {};
+
+      if (!email) {
+        return res.status(400).json({
+          error:
+            "email is required",
+        });
+      }
+
+      const cleanMessage =
+        String(message || "").trim();
+
+      if (!cleanMessage) {
+        return res.status(400).json({
+          error:
+            "message is required",
+        });
+      }
+
+      const normalizedEmail =
+        String(email)
+          .trim()
+          .toLowerCase();
+
+      const userRecord =
+        await findFirebaseUserByEmail(
+          normalizedEmail
+        );
+
+      if (userRecord.disabled) {
+        return res.status(400).json({
+          error:
+            "This Firebase account is disabled.",
+        });
+      }
+
+      await publishPrivateTicker({
+        targetUid:
+          userRecord.uid,
+
+        targetEmail:
+          userRecord.email ||
+          normalizedEmail,
+
+        message:
+          cleanMessage,
+
+        createdBy:
+          decoded.uid,
+
+        createdByEmail:
+          decoded.email ||
+          null,
+      });
+
+      return res.json({
+        success: true,
+
+        mode: "single",
+
+        targetUid:
+          userRecord.uid,
+
+        targetEmail:
+          userRecord.email ||
+          normalizedEmail,
+
+        message:
+          "Private ticker sent successfully.",
+      });
+    } catch (error) {
+      console.error(
+        "Private ticker error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not publish private ticker",
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// OLD PRIVATE TICKER CLEAR ENDPOINT
+// =====================================================
+
+app.post(
+  "/admin/private-ticker/clear",
+  async (req, res) => {
+    try {
+      const decoded =
+        await requireAdmin(req);
+
+      const {
+        email,
+      } = req.body || {};
+
+      if (!email) {
+        return res.status(400).json({
+          error:
+            "email is required",
+        });
+      }
+
+      const normalizedEmail =
+        String(email)
+          .trim()
+          .toLowerCase();
+
+      const userRecord =
+        await findFirebaseUserByEmail(
+          normalizedEmail
+        );
+
+      await db
+        .collection("userTickers")
+        .doc(userRecord.uid)
+        .set(
+          {
+            active: false,
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+
+            clearedBy:
+              decoded.uid,
+
+            clearedByEmail:
+              decoded.email ||
+              null,
+          },
+          {
+            merge: true,
+          }
+        );
+
+      return res.json({
+        success: true,
+
+        message:
+          "Private ticker cleared.",
+      });
+    } catch (error) {
+      console.error(
+        "Clear private ticker error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not clear private ticker",
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// OLD GLOBAL TICKER ENDPOINT
+// =====================================================
+
+app.post(
+  "/admin/global-ticker",
+  async (req, res) => {
+    try {
+      const decoded =
+        await requireAdmin(req);
+
+      const {
+        message,
+      } = req.body || {};
+
+      const cleanMessage =
+        String(message || "").trim();
+
+      if (!cleanMessage) {
+        return res.status(400).json({
+          error:
+            "message is required",
+        });
+      }
+
+      await db
+        .collection("settings")
+        .doc("liveTicker")
+        .set(
+          {
+            active: true,
+
+            message:
+              cleanMessage,
+
+            targetType:
+              "all",
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+
+            createdBy:
+              decoded.uid,
+
+            createdByEmail:
+              decoded.email ||
+              null,
+          },
+          {
+            merge: true,
+          }
+        );
+
+      return res.json({
+        success: true,
+
+        mode: "all",
+
+        message:
+          "Global ticker published successfully.",
+      });
+    } catch (error) {
+      console.error(
+        "Global ticker error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not publish global ticker",
+      });
+    }
+  }
+);
+
+
+// =====================================================
+// OLD GLOBAL TICKER CLEAR ENDPOINT
+// =====================================================
+
+app.post(
+  "/admin/global-ticker/clear",
+  async (req, res) => {
+    try {
+      await requireAdmin(req);
+
+      await db
+        .collection("settings")
+        .doc("liveTicker")
+        .set(
+          {
+            active: false,
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          }
+        );
+
+      return res.json({
+        success: true,
+
+        message:
+          "Global ticker cleared.",
+      });
+    } catch (error) {
+      console.error(
+        "Clear global ticker error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        error:
+          error.message ||
+          "Could not clear global ticker",
+      });
+    }
+  }
+);
 
 // =====================================================
 // 1. INITIALIZE PAYMENT
