@@ -42,7 +42,23 @@ const CAMPUSMART_AI_MODEL =
   process.env.GEMINI_AI_MODEL ||
   process.env.GROK_AI_MODEL ||
   process.env.OPENAI_AI_MODEL ||
-  "gemini-1.5-flash";
+  "gemini-2.5-flash";
+
+/*
+ * If the configured model is unavailable, try these free-tier
+ * Flash models in order (current as of 2026).
+ */
+const GEMINI_MODEL_FALLBACKS = [
+  CAMPUSMART_AI_MODEL,
+  "gemini-2.5-flash",
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+].filter(
+  (name, index, arr) =>
+    name && arr.indexOf(name) === index
+);
 
 const GEMINI_BASE_URL =
   process.env.GEMINI_BASE_URL ||
@@ -5769,51 +5785,98 @@ app.post(
       ];
 
       let completion;
+      let activeModel = CAMPUSMART_AI_MODEL;
+      let lastErr = null;
 
-      try {
-        completion =
-          await openai.chat.completions.create(
-            {
-              model: CAMPUSMART_AI_MODEL,
-              messages: chatMessages,
-              tools: campusMartAiTools,
-              tool_choice: "auto",
-              temperature: 0.4,
-              max_tokens: 450,
-            }
-          );
-      } catch (firstErr) {
-        /*
-         * If tools are rejected by the provider, retry once without tools
-         * so the user still gets a helpful reply.
-         */
-        const firstMsg = String(
-          firstErr?.message || ""
-        ).toLowerCase();
-
-        console.error(
-          "CampusMart AI first call failed:",
-          firstErr?.message || firstErr
-        );
-
-        if (
-          firstMsg.includes("tool") ||
-          firstMsg.includes("function") ||
-          firstMsg.includes("schema")
-        ) {
+      for (const modelName of GEMINI_MODEL_FALLBACKS) {
+        try {
           completion =
             await openai.chat.completions.create(
               {
-                model: CAMPUSMART_AI_MODEL,
+                model: modelName,
                 messages: chatMessages,
+                tools: campusMartAiTools,
+                tool_choice: "auto",
                 temperature: 0.4,
                 max_tokens: 450,
               }
             );
-        } else {
-          throw firstErr;
+
+          activeModel = modelName;
+          lastErr = null;
+          break;
+        } catch (firstErr) {
+          lastErr = firstErr;
+
+          const firstMsg = String(
+            firstErr?.message || ""
+          ).toLowerCase();
+
+          console.error(
+            `CampusMart AI call failed for model ${modelName}:`,
+            firstErr?.message || firstErr
+          );
+
+          /*
+           * Tools rejected → retry same model without tools.
+           */
+          if (
+            firstMsg.includes("tool") ||
+            firstMsg.includes("function") ||
+            firstMsg.includes("schema")
+          ) {
+            try {
+              completion =
+                await openai.chat.completions.create(
+                  {
+                    model: modelName,
+                    messages: chatMessages,
+                    temperature: 0.4,
+                    max_tokens: 450,
+                  }
+                );
+
+              activeModel = modelName;
+              lastErr = null;
+              break;
+            } catch (noToolErr) {
+              lastErr = noToolErr;
+            }
+          }
+
+          /*
+           * Model not found → try next fallback.
+           */
+          const isModelMissing =
+            firstMsg.includes("model") &&
+            (
+              firstMsg.includes("not found") ||
+              firstMsg.includes("does not exist") ||
+              firstMsg.includes("invalid") ||
+              firstMsg.includes("not supported") ||
+              firstMsg.includes("not available")
+            );
+
+          if (!isModelMissing) {
+            // Auth / quota / other → stop trying models
+            throw firstErr;
+          }
         }
       }
+
+      if (!completion) {
+        throw (
+          lastErr ||
+          new Error(
+            "No available Gemini model for this API key."
+          )
+        );
+      }
+
+      console.log(
+        "CampusMart AI using model:",
+        activeModel
+      );
 
       let finalProducts = [];
       let finalGigs = [];
@@ -5950,7 +6013,7 @@ app.post(
         completion =
           await openai.chat.completions.create(
             {
-              model: CAMPUSMART_AI_MODEL,
+              model: activeModel,
               messages: chatMessages,
               tools: campusMartAiTools,
               tool_choice: "auto",
@@ -6144,7 +6207,7 @@ app.post(
         return res.status(500).json({
           success: false,
           error:
-            "That AI model is not available for your Gemini key. Set GEMINI_AI_MODEL=gemini-1.5-flash (or another model shown in Google AI Studio).",
+            "That AI model is not available for your Gemini key. Set GEMINI_AI_MODEL=gemini-2.5-flash or gemini-3.8-flash (models shown in Google AI Studio).",
         });
       }
 
