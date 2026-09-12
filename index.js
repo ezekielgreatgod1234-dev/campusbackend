@@ -119,7 +119,7 @@ app.use(
         new Error("Not allowed by CORS")
       );
     },
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "Content-Type",
       "Authorization",
@@ -5441,9 +5441,17 @@ LIVE DATA RULES:
 
 USER-FACING FACTS ONLY:
 - Browse products, checkout, pay in ₦ in the app.
-- Sellers list products and can withdraw from ₦1,000 (need bank details).
 - Gigs exist (tutoring, design, repairs, etc.).
 - You cannot place orders, pay, message sellers, or withdraw for the user.
+
+HOW TO BECOME A SELLER (use this exact flow whenever asked "how do I become a seller" or similar — never invent a different process):
+1. Create a CampusMart account (or open your existing account settings).
+2. During signup, choose the "Seller" option/account type.
+3. Agree to and confirm the Terms and Conditions.
+4. Complete account creation — once successful, the account is now a seller account.
+5. From the seller dashboard, add products, set prices, and create gigs.
+6. Once products/gigs are added, the store goes live on CampusMart for buyers to see.
+- Sellers can withdraw earnings from ₦1,000 once they have a payout method (bank details) set up.
 
 NEVER discuss: backend, Firebase, admin, APIs, keys, databases, or internal systems. If asked, politely say you only help with shopping, gigs, and orders on CampusMart.
 
@@ -5597,6 +5605,60 @@ async function saveAiConversation({
       error.message
     );
   }
+}
+
+async function deleteAiConversation(uid) {
+  if (!uid) {
+    return;
+  }
+
+  await db
+    .collection("aiConversations")
+    .doc(uid)
+    .delete();
+}
+
+async function deleteAiMessageFromConversation(uid, messageId) {
+  if (!uid || !messageId) {
+    return { removed: false };
+  }
+
+  const ref = db
+    .collection("aiConversations")
+    .doc(uid);
+
+  const snap = await ref.get();
+
+  if (!snap.exists) {
+    return { removed: false };
+  }
+
+  const data = snap.data() || {};
+
+  const messages = Array.isArray(data.messages)
+    ? data.messages
+    : [];
+
+  const filtered = messages.filter(
+    (m) => String(m?.id || "") !== String(messageId)
+  );
+
+  if (filtered.length === messages.length) {
+    return { removed: false };
+  }
+
+  await ref.set(
+    {
+      messages: filtered,
+      updatedAt: FieldValue.serverTimestamp(),
+      messageCount: filtered.length,
+    },
+    {
+      merge: true,
+    }
+  );
+
+  return { removed: true };
 }
 
 /*
@@ -5823,6 +5885,126 @@ app.get(
 
 /*
  * ---------------------------------------------------------
+ * AI HISTORY (delete saved chat)
+ * ---------------------------------------------------------
+ */
+
+app.delete(
+  "/ai/history",
+  async (req, res) => {
+    try {
+      const decoded =
+        await verifyFirebaseUser(
+          req
+        );
+
+      const uid =
+        decoded.uid;
+
+      if (!uid) {
+        return res.status(401).json({
+          success: false,
+          error:
+            "Please log in to use CampusMart AI.",
+        });
+      }
+
+      await deleteAiConversation(uid);
+
+      return res.json({
+        success: true,
+        message:
+          "CampusMart AI chat history was deleted.",
+      });
+    } catch (error) {
+      console.error(
+        "AI history delete error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        success: false,
+        error:
+          error.message ||
+          "Could not delete chat history.",
+      });
+    }
+  }
+);
+
+
+/*
+ * ---------------------------------------------------------
+ * AI HISTORY (delete a single message)
+ * ---------------------------------------------------------
+ */
+
+app.delete(
+  "/ai/history/messages/:messageId",
+  async (req, res) => {
+    try {
+      const decoded =
+        await verifyFirebaseUser(
+          req
+        );
+
+      const uid =
+        decoded.uid;
+
+      if (!uid) {
+        return res.status(401).json({
+          success: false,
+          error:
+            "Please log in to use CampusMart AI.",
+        });
+      }
+
+      const messageId =
+        String(
+          req.params?.messageId || ""
+        ).trim();
+
+      if (!messageId) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "messageId is required.",
+        });
+      }
+
+      const result =
+        await deleteAiMessageFromConversation(
+          uid,
+          messageId
+        );
+
+      return res.json({
+        success: true,
+        removed: result.removed,
+      });
+    } catch (error) {
+      console.error(
+        "AI message delete error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        success: false,
+        error:
+          error.message ||
+          "Could not delete that message.",
+      });
+    }
+  }
+);
+
+
+/*
+ * ---------------------------------------------------------
  * AI CHAT ENDPOINT
  * ---------------------------------------------------------
  */
@@ -5830,6 +6012,23 @@ app.get(
 app.post(
   "/ai/chat",
   async (req, res) => {
+    /*
+     * Lets the client stop a reply mid-flight. If the browser
+     * aborts the fetch (Stop button) or navigates away, this
+     * fires, we cancel the in-flight Gemini call, and we skip
+     * saving/responding since nobody is listening anymore.
+     */
+    const abortController = new AbortController();
+    let clientDisconnected = false;
+
+    req.on("close", () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+      }
+
+      abortController.abort();
+    });
+
     try {
       /*
        * OpenAI configuration check
@@ -6033,6 +6232,9 @@ app.post(
                 tool_choice: "auto",
                 temperature: 0.4,
                 max_tokens: 450,
+              },
+              {
+                signal: abortController.signal,
               }
             );
 
@@ -6067,6 +6269,9 @@ app.post(
                     messages: chatMessages,
                     temperature: 0.4,
                     max_tokens: 450,
+                  },
+                  {
+                    signal: abortController.signal,
                   }
                 );
 
@@ -6253,8 +6458,19 @@ app.post(
               tool_choice: "auto",
               temperature: 0.4,
               max_tokens: 450,
+            },
+            {
+              signal: abortController.signal,
             }
           );
+      }
+
+      /*
+       * Client already left (Stop button / navigation) — don't
+       * waste time building or saving a response nobody wants.
+       */
+      if (clientDisconnected) {
+        return;
       }
 
       /*
@@ -6360,6 +6576,26 @@ app.post(
             : [],
       });
     } catch (error) {
+      /*
+       * The client stopped the reply or disconnected — the
+       * OpenAI call was aborted on purpose. Nothing to send
+       * back and nothing to save.
+       */
+      const isAbort =
+        error?.name === "AbortError" ||
+        error?.name === "APIUserAbortError" ||
+        String(error?.message || "")
+          .toLowerCase()
+          .includes("abort");
+
+      if (clientDisconnected || isAbort) {
+        console.log(
+          "CampusMart AI reply stopped by client."
+        );
+
+        return;
+      }
+
       console.error(
         "CampusMart AI endpoint error:",
         error
