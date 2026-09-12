@@ -4813,7 +4813,7 @@ async function searchCampusMartProducts(
 async function searchCampusMartGigs(
   args = {}
 ) {
-  const queryText =
+  const rawQuery =
     String(
       args.query || ""
     )
@@ -4844,14 +4844,86 @@ async function searchCampusMartGigs(
       args.maxBudget
     );
 
+  const stopWords = new Set([
+    "a", "an", "the", "and", "or", "for", "to", "of", "in",
+    "on", "at", "is", "are", "me", "my", "i", "im", "i'm",
+    "find", "show", "search", "looking", "look", "want",
+    "need", "get", "see", "any", "available", "currently",
+    "something", "anything", "please", "all", "list",
+    "campusmart", "campus", "mart",
+  ]);
+
+  /*
+   * Generic words that mean "browse gigs", not a topic keyword.
+   */
+  const browseWords = new Set([
+    "gig",
+    "gigs",
+    "job",
+    "jobs",
+    "work",
+    "service",
+    "services",
+    "freelance",
+    "opportunity",
+    "opportunities",
+  ]);
+
+  const rawTokens =
+    rawQuery
+      .replace(/[₦$,]/g, " ")
+      .replace(/[^a-z0-9\s+.-]/gi, " ")
+      .split(/\s+/)
+      .map((w) => w.trim())
+      .filter(Boolean);
+
+  const meaningfulTokens =
+    rawTokens.filter(
+      (w) =>
+        !stopWords.has(w) &&
+        w.length >= 2 &&
+        !/^\d+(\.\d+)?$/.test(w)
+    );
+
+  const topicTokens =
+    meaningfulTokens.filter(
+      (w) => !browseWords.has(w)
+    );
+
+  /*
+   * "show me gigs" / "find gigs" / empty topic → browse all open gigs.
+   */
+  const isBrowseRequest =
+    topicTokens.length === 0;
+
+  const queryWords =
+    topicTokens.length
+      ? topicTokens
+      : [];
+
   let snapshot;
 
   try {
+    /*
+     * Support both common collection names.
+     */
     snapshot =
       await db
         .collection("gigs")
-        .limit(150)
+        .limit(300)
         .get();
+
+    if (snapshot.empty) {
+      const alt =
+        await db
+          .collection("gig")
+          .limit(300)
+          .get();
+
+      if (!alt.empty) {
+        snapshot = alt;
+      }
+    }
   } catch (error) {
     console.error(
       "CampusMart gig search error:",
@@ -4863,11 +4935,23 @@ async function searchCampusMartGigs(
     );
   }
 
+  console.log(
+    "CampusMart gig search:",
+    {
+      rawQuery,
+      topicTokens,
+      isBrowseRequest,
+      totalDocs: snapshot.docs.length,
+      category,
+      campus,
+      minBudget,
+      maxBudget,
+    }
+  );
+
   const results = [];
 
-  for (
-    const docSnap of snapshot.docs
-  ) {
+  for (const docSnap of snapshot.docs) {
     const data =
       docSnap.data() || {};
 
@@ -4878,6 +4962,8 @@ async function searchCampusMartGigs(
           "title",
           "name",
           "gigTitle",
+          "gigName",
+          "jobTitle",
         ],
         "Campus Gig"
       );
@@ -4889,6 +4975,8 @@ async function searchCampusMartGigs(
           "description",
           "details",
           "gigDescription",
+          "about",
+          "summary",
         ],
         ""
       );
@@ -4900,6 +4988,9 @@ async function searchCampusMartGigs(
           "category",
           "type",
           "gigCategory",
+          "jobType",
+          "skill",
+          "skills",
         ],
         ""
       );
@@ -4910,6 +5001,9 @@ async function searchCampusMartGigs(
         [
           "location",
           "campus",
+          "school",
+          "university",
+          "address",
         ],
         ""
       );
@@ -4922,6 +5016,9 @@ async function searchCampusMartGigs(
             "budget",
             "price",
             "amount",
+            "pay",
+            "payment",
+            "rate",
           ],
           null
         )
@@ -4934,8 +5031,9 @@ async function searchCampusMartGigs(
           [
             "status",
             "availability",
+            "gigStatus",
           ],
-          ""
+          "active"
         )
       ).toLowerCase();
 
@@ -4945,6 +5043,11 @@ async function searchCampusMartGigs(
         "removed",
         "inactive",
         "closed",
+        "draft",
+        "rejected",
+        "banned",
+        "expired",
+        "completed",
       ].includes(status)
     ) {
       continue;
@@ -4972,9 +5075,7 @@ async function searchCampusMartGigs(
 
     if (
       category &&
-      !String(
-        gigCategory
-      )
+      !String(gigCategory)
         .toLowerCase()
         .includes(category)
     ) {
@@ -4983,62 +5084,84 @@ async function searchCampusMartGigs(
 
     if (
       campus &&
-      !String(
-        location
-      )
+      !String(location)
         .toLowerCase()
         .includes(campus)
     ) {
       continue;
     }
 
-    const searchableText =
+    const titleText =
+      String(title).toLowerCase();
+
+    const categoryText =
+      String(gigCategory).toLowerCase();
+
+    const descriptionText =
+      String(description).toLowerCase();
+
+    const tagsText =
+      data.tags
+        ? (
+            Array.isArray(data.tags)
+              ? data.tags.join(" ")
+              : String(data.tags)
+          ).toLowerCase()
+        : "";
+
+    const productText =
       [
-        title,
-        description,
-        gigCategory,
-        location,
+        titleText,
+        categoryText,
+        descriptionText,
+        tagsText,
+        String(location).toLowerCase(),
       ]
         .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
+        .join(" ");
 
     let score = 0;
+    let matched = false;
 
-    if (queryText) {
-      if (
-        searchableText.includes(
-          queryText
-        )
-      ) {
-        score += 20;
-      }
+    if (isBrowseRequest) {
+      score = 1;
+      matched = true;
+    } else {
+      for (const word of queryWords) {
+        if (titleText.includes(word)) {
+          score += 20;
+          matched = true;
+        }
 
-      const words =
-        queryText
-          .split(/\s+/)
-          .filter(
-            (word) =>
-              word.length >= 2
-          );
+        if (categoryText.includes(word)) {
+          score += 16;
+          matched = true;
+        }
 
-      for (const word of words) {
-        if (
-          searchableText.includes(
-            word
-          )
-        ) {
-          score += 3;
+        if (tagsText.includes(word)) {
+          score += 12;
+          matched = true;
+        }
+
+        if (descriptionText.includes(word)) {
+          score += 8;
+          matched = true;
         }
       }
-    } else {
-      score = 1;
+
+      const phrase =
+        queryWords.join(" ");
+
+      if (
+        phrase &&
+        titleText.includes(phrase)
+      ) {
+        score += 25;
+        matched = true;
+      }
     }
 
-    if (
-      queryText &&
-      score <= 0
-    ) {
+    if (!matched) {
       continue;
     }
 
@@ -5072,8 +5195,13 @@ async function searchCampusMartGigs(
       b._score - a._score
   );
 
+  console.log(
+    "CampusMart gig search results:",
+    results.length
+  );
+
   return results
-    .slice(0, 8)
+    .slice(0, 12)
     .map(
       ({
         _score,
@@ -5234,7 +5362,7 @@ const campusMartAiTools = [
     function: {
       name: "search_gigs",
       description:
-        "REQUIRED for any gig-related request. Search live CampusMart gig listings. Never invent gigs.",
+        "REQUIRED for any gig-related request. Search live CampusMart gig listings. For general requests like show gigs or find jobs, use query=\"gigs\". For specific topics use short keywords like tutoring or design. Never invent gigs.",
       parameters: {
         type: "object",
         properties: {
