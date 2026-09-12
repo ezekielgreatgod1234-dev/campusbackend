@@ -5477,6 +5477,111 @@ async function saveAiConversation({
  */
 
 app.get(
+  "/ai/health",
+  async (req, res) => {
+    try {
+      if (!GEMINI_API_KEY) {
+        return res.status(503).json({
+          success: false,
+          configured: false,
+          error:
+            "GEMINI_API_KEY is not set on the server.",
+          help: "Create a free key at https://aistudio.google.com/apikey",
+        });
+      }
+
+      const tried = [];
+      let workingModel = null;
+      let lastError = null;
+
+      for (const modelName of GEMINI_MODEL_FALLBACKS) {
+        try {
+          const test =
+            await openai.chat.completions.create(
+              {
+                model: modelName,
+                messages: [
+                  {
+                    role: "user",
+                    content: "Reply with OK only.",
+                  },
+                ],
+                max_tokens: 8,
+                temperature: 0,
+              }
+            );
+
+          const reply =
+            test?.choices?.[0]?.message
+              ?.content || "";
+
+          workingModel = modelName;
+          tried.push({
+            model: modelName,
+            ok: true,
+            sample: String(reply).slice(0, 40),
+          });
+          break;
+        } catch (err) {
+          const msg =
+            err?.message ||
+            err?.error?.message ||
+            String(err);
+
+          lastError = msg;
+          tried.push({
+            model: modelName,
+            ok: false,
+            error: String(msg).slice(0, 200),
+          });
+        }
+      }
+
+      if (!workingModel) {
+        return res.status(502).json({
+          success: false,
+          configured: true,
+          provider: "Google Gemini",
+          baseURL: GEMINI_BASE_URL,
+          keyPresent: true,
+          keyPreview:
+            String(GEMINI_API_KEY).slice(0, 6) +
+            "...",
+          tried,
+          error:
+            lastError ||
+            "No Gemini model responded.",
+          help:
+            "Set GEMINI_AI_MODEL to a free model from AI Studio, e.g. gemini-2.5-flash or gemini-3.8-flash.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        configured: true,
+        provider: "Google Gemini",
+        model: workingModel,
+        baseURL: GEMINI_BASE_URL,
+        keyPresent: true,
+        keyPreview:
+          String(GEMINI_API_KEY).slice(0, 6) +
+          "...",
+        tried,
+        message:
+          "CampusMart AI can reach Gemini successfully.",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "AI health check failed.",
+      });
+    }
+  }
+);
+
+app.get(
   "/ai/history",
   async (req, res) => {
     try {
@@ -6212,19 +6317,23 @@ app.post(
       }
 
       /*
-       * Safe short message for users (no secrets).
-       * Keep useful short provider hints when they are readable.
+       * Always return an actionable message (never a vague dead-end).
        */
       let userMessage =
-        "CampusMart AI is temporarily unavailable. Please try again.";
+        "CampusMart AI could not reach Gemini. Check GEMINI_API_KEY and GEMINI_AI_MODEL on the server, then open /ai/health.";
 
-      if (
+      if (!GEMINI_API_KEY) {
+        userMessage =
+          "GEMINI_API_KEY is missing on the server. Add your free key from https://aistudio.google.com/apikey";
+      } else if (
         message &&
-        message.length < 160 &&
         !lower.includes("sk-") &&
-        !lower.includes("aiza")
+        !/aiza[a-z0-9_-]{10,}/i.test(message)
       ) {
-        userMessage = message;
+        userMessage =
+          message.length > 220
+            ? message.slice(0, 220) + "…"
+            : message;
       }
 
       return res
@@ -6236,6 +6345,8 @@ app.post(
         .json({
           success: false,
           error: userMessage,
+          model: CAMPUSMART_AI_MODEL,
+          provider: "Google Gemini",
         });
     }
   }
