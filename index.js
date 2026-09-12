@@ -5350,8 +5350,6 @@ app.post(
 
             tools:
               campusMartAiTools,
-
-            temperature: 0.2,
           }
         );
 
@@ -5593,8 +5591,6 @@ app.post(
 
               tools:
                 campusMartAiTools,
-
-              temperature: 0.2,
             }
           );
       }
