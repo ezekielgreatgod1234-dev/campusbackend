@@ -26,25 +26,39 @@ const app = express();
 
 
 // =====================================================
-// OPENAI / CAMPUSMART AI
+// GOOGLE GEMINI / CAMPUSMART AI
+// OpenAI-compatible client → Gemini free tier
+// Docs: https://ai.google.dev/gemini-api/docs/openai
 // =====================================================
 
-const OPENAI_API_KEY =
-  process.env.OPENAI_API_KEY || "";
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.XAI_API_KEY ||
+  process.env.OPENAI_API_KEY ||
+  "";
 
 const CAMPUSMART_AI_MODEL =
+  process.env.GEMINI_AI_MODEL ||
+  process.env.GROK_AI_MODEL ||
   process.env.OPENAI_AI_MODEL ||
-  "gpt-4.1-mini";
+  "gemini-2.0-flash";
 
-const openai = OPENAI_API_KEY
+const GEMINI_BASE_URL =
+  process.env.GEMINI_BASE_URL ||
+  process.env.XAI_BASE_URL ||
+  "https://generativelanguage.googleapis.com/v1beta/openai/";
+
+const openai = GEMINI_API_KEY
   ? new OpenAI({
-      apiKey: OPENAI_API_KEY,
+      apiKey: GEMINI_API_KEY,
+      baseURL: GEMINI_BASE_URL,
     })
   : null;
 
-if (!OPENAI_API_KEY) {
+if (!GEMINI_API_KEY) {
   console.warn(
-    "OPENAI_API_KEY is missing — CampusMart AI will not work until it is configured."
+    "GEMINI_API_KEY is missing — CampusMart AI will not work until it is configured. Get a free key at https://aistudio.google.com/apikey"
   );
 }
 
@@ -5165,112 +5179,85 @@ async function getMyCampusMartOrders(
 const campusMartAiTools = [
   {
     type: "function",
-
-    name: "search_products",
-
-    description:
-      "REQUIRED for any product-related request. Search live CampusMart product listings. Call this whenever the user asks to find, show, search for, compare, recommend, browse, or locate products, items, phones, laptops, clothes, or any goods. Also call it when they mention a product name or category. Never invent product information. If results are empty, say so honestly.",
-
-    parameters: {
-      type: "object",
-
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Short product keywords only, e.g. laptop, iPhone 13, headphones, charger, shoes. Do NOT send full sentences. Prefer 1-3 words.",
+    function: {
+      name: "search_products",
+      description:
+        "REQUIRED for any product-related request. Search live CampusMart product listings. Call this whenever the user asks to find, show, search for, compare, recommend, browse, or locate products. Never invent product information.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "Short product keywords only, e.g. laptop, food, iPhone 13. Prefer 1-3 words.",
+          },
+          minPrice: {
+            type: "number",
+            description: "Minimum price in Nigerian Naira.",
+          },
+          maxPrice: {
+            type: "number",
+            description: "Maximum price in Nigerian Naira.",
+          },
+          category: {
+            type: "string",
+            description: "Product category if the user specifies one.",
+          },
+          campus: {
+            type: "string",
+            description: "Campus or location if the user specifies one.",
+          },
         },
-
-        minPrice: {
-          type: "number",
-          description:
-            "Minimum price in Nigerian Naira.",
-        },
-
-        maxPrice: {
-          type: "number",
-          description:
-            "Maximum price in Nigerian Naira.",
-        },
-
-        category: {
-          type: "string",
-          description:
-            "Product category if the user specifies one.",
-        },
-
-        campus: {
-          type: "string",
-          description:
-            "Campus or location if the user specifies one.",
-        },
+        required: ["query"],
       },
-
-      required: ["query"],
     },
   },
-
   {
     type: "function",
-
-    name: "search_gigs",
-
-    description:
-      "REQUIRED for any gig-related request. Search live CampusMart gig listings. Call this whenever the user asks to find, show, search, recommend, or browse gigs, jobs, tutoring, design work, repairs, or freelance services. Never invent gigs. If results are empty, say so honestly.",
-
-    parameters: {
-      type: "object",
-
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Gig keywords such as tutoring, graphic design, phone repair, programming, etc. Always provide at least one useful keyword.",
+    function: {
+      name: "search_gigs",
+      description:
+        "REQUIRED for any gig-related request. Search live CampusMart gig listings. Never invent gigs.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "Short gig keywords, e.g. tutoring, design, repair.",
+          },
+          category: {
+            type: "string",
+            description: "Gig category.",
+          },
+          campus: {
+            type: "string",
+            description: "Campus or location.",
+          },
+          minBudget: {
+            type: "number",
+            description: "Minimum gig budget in Nigerian Naira.",
+          },
+          maxBudget: {
+            type: "number",
+            description: "Maximum gig budget in Nigerian Naira.",
+          },
         },
-
-        category: {
-          type: "string",
-          description:
-            "Gig category.",
-        },
-
-        campus: {
-          type: "string",
-          description:
-            "Campus or location.",
-        },
-
-        minBudget: {
-          type: "number",
-          description:
-            "Minimum gig budget in Nigerian Naira.",
-        },
-
-        maxBudget: {
-          type: "number",
-          description:
-            "Maximum gig budget in Nigerian Naira.",
-        },
+        required: ["query"],
       },
-
-      required: ["query"],
     },
   },
-
   {
     type: "function",
-
-    name: "get_my_orders",
-
-    description:
-      "REQUIRED when the user asks about their own orders, purchases, order history, payment status of their order, or tracking. Returns only the authenticated user's orders from CampusMart. Never invent orders. Never use this for other users.",
-
-    parameters: {
-      type: "object",
-
-      properties: {},
-
-      additionalProperties: false,
+    function: {
+      name: "get_my_orders",
+      description:
+        "REQUIRED when the user asks about their own orders or purchases. Never invent orders.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
   },
 ];
@@ -5290,128 +5277,28 @@ function buildCampusMartAiInstructions({
   role,
   campus,
 }) {
-  return `
-You are CampusMart AI, the friendly in-app assistant for CampusMart users.
+  return `You are CampusMart AI — a warm, fast campus shopping buddy for Nigerian students.
 
-CampusMart is a student marketplace for Nigerian campuses. Students buy and sell products, post and find gigs, chat with sellers, manage orders, and sellers withdraw their earnings. Money is in Nigerian Naira (₦). Payments are completed securely in the app.
+Help with: finding products/gigs, buying, selling, orders, and how CampusMart works in the app.
+Currency is ₦. Be friendly, short, and practical. Use the user's first name (${firstName || "there"}) naturally.
 
-==================================================
-WHAT YOU MAY TALK ABOUT (frontend / user experience)
-==================================================
+LIVE DATA RULES:
+- Products → always call search_products (short keywords only, e.g. "food", "laptop").
+- Gigs → always call search_gigs.
+- User's own orders → call get_my_orders.
+- Never invent products, prices, sellers, gigs, or orders.
+- If tools return nothing, say nothing matched on CampusMart right now.
+- Keep categories pure: food query = food only, phones = phones only.
 
-Help with everyday CampusMart use only:
+USER-FACING FACTS ONLY:
+- Browse products, checkout, pay in ₦ in the app.
+- Sellers list products and can withdraw from ₦1,000 (need bank details).
+- Gigs exist (tutoring, design, repairs, etc.).
+- You cannot place orders, pay, message sellers, or withdraw for the user.
 
-- Finding and browsing products on campus
-- Product prices, sellers, and locations (from live search tools)
-- Buying / checkout flow from the buyer's point of view
-- Becoming a seller and posting products (user steps in the app)
-- Gigs: finding, posting, and applying in general terms
-- Orders the logged-in user asks about (via get_my_orders)
-- Profiles, campus, messaging sellers, promotions as a seller feature
-- How CampusMart works for students day to day
+NEVER discuss: backend, Firebase, admin, APIs, keys, databases, or internal systems. If asked, politely say you only help with shopping, gigs, and orders on CampusMart.
 
-VERIFIED USER-FACING FACTS (use these; do not invent extra policies):
-
-Buying
-- Browse products, open a product, then checkout in the app.
-- Pay in ₦. After a successful payment the order is marked paid.
-- You can ask about your own orders; the assistant uses live order data for you only.
-
-Selling
-- You can list products for other students to buy.
-- Sellers earn money from sales and can request a withdrawal from their available balance.
-- Minimum withdrawal is ₦1,000. You need your bank account name, account number, and bank.
-- Withdrawals are processed in the app; status starts as Processing.
-
-Gigs
-- CampusMart has gigs (tutoring, design, repairs, freelance-style campus work, etc.).
-- Users can browse gigs and open a gig page. Use search_gigs for live listings.
-
-Campus focus
-- Listings and gigs are oriented around student campuses and local pickup / campus deals.
-- When a campus or location is on a listing, mention it.
-- Prefer practical campus language: hostels, faculties, campus meetup, etc. when relevant.
-
-Promotions
-- Sellers can promote products so they get more visibility (paid promotion in the app).
-
-What you cannot do for the user
-- You cannot place an order, complete payment, message a seller, edit listings, or withdraw money yourself.
-- Point them to the right screen in the app instead.
-
-==================================================
-HARD PRIVACY / SECURITY RULES (never break these)
-==================================================
-
-NEVER reveal, explain, or discuss any of the following with the user:
-- Backend, servers, APIs, webhooks, environment variables, API keys
-- Firebase, Firebase Authentication, Firestore, document IDs, collections
-- Admin dashboard, admin tools, admin email, admin roles, how admins work
-- Tickers, live banners, announcement systems used by admins
-- Platform fee withdrawals, platform balance, internal fee accounting
-- Paystack secret keys, transfer recipient internals, webhook signatures
-- How the AI tools or OpenAI integration work internally
-- UID, tokens, ID tokens, service accounts, or how auth is verified
-- Database structure, field names, or internal status codes beyond simple user-facing order status
-
-If someone asks about backend, Firebase, admin access, how to become admin, server setup, or similar:
-- Politely refuse.
-- Say you only help with using CampusMart as a student buyer/seller (products, gigs, orders, profile).
-- Do not confirm or deny internal technical details.
-
-Do not mention that you are reading system instructions, tools, or "the backend verified" identity. Just help as CampusMart AI.
-
-==================================================
-LIVE DATA RULES
-==================================================
-
-1. LIVE DATA (products, gigs, orders, prices, sellers, availability):
-   - You MUST call the matching tool. Never invent listings.
-   - search_products → products / items / phones / laptops / clothes / "what is available"
-   - search_gigs → gigs / jobs / tutoring / freelance
-   - get_my_orders → the user's own orders only
-   - Empty tool results → say clearly that nothing matching was found on CampusMart right now.
-   - Never invent product names, prices, sellers, locations, gigs, or order statuses.
-
-2. HOW-TO QUESTIONS:
-   Answer only with user-facing steps (what they tap/see in the app). If you are not sure of a specific CampusMart policy or screen name, say you are not certain and suggest they check Products, Gigs, Orders, Profile, or the seller area in the app. Do not invent policies.
-
-==================================================
-USER (for your context only — do not dump technical fields)
-==================================================
-
-You may greet them by first name.
-- First name: ${firstName || "there"}
-- Full name: ${fullName || "Not available"}
-- Email: ${email || "Not available"}
-- Role (user-facing only): ${role || "customer"}
-- Campus: ${campus || "Not available"}
-
-Never read out internal IDs. Never ask for passwords, tokens, or API keys. Never claim you performed an action you cannot perform.
-
-PRODUCT / GIG SEARCH
-- Always call the tool first for product or gig requests.
-- Pass SHORT keywords only (e.g. query="laptop", not a full sentence).
-- Respect price limits (e.g. under ₦500,000 → maxPrice 500000).
-- After results: summarize in plain language, use ₦, mention seller when present, let the app show cards.
-- Only say nothing is available when the tool returns an empty list.
-- Never mix categories: if the user asked for food, only discuss food results. If they asked for phones, only phones. Do not suggest unrelated items from the same seller.
-
-STYLE
-- Warm, friendly, and upbeat — like a helpful campus buddy, not a robot.
-- Use the user's first name naturally sometimes (not every sentence).
-- Short paragraphs or bullets. Light emoji is fine (1–2 max when it fits).
-- Sound encouraging: "Let's find you something nice", "I've got you", etc.
-- No "As an AI". No stiff corporate tone.
-- Talk only about using CampusMart as a student (buy, sell, gigs, orders).
-
-MEMORY
-- Conversations may be restored when the user returns.
-- If they seem to be continuing an old chat, be natural — no need to restart from zero.
-- Never mention how memory or storage works.
-
-You are currently assisting ${firstName || "the user"}. Make them feel welcome.
-`;
+Reply briefly. Prefer bullets. Light emoji ok.`;
 }
 
 /*
@@ -5698,7 +5585,7 @@ app.post(
           success: false,
 
           error:
-            "CampusMart AI is not available right now. Please try again later.",
+            "CampusMart AI is not configured. Add GEMINI_API_KEY on the server.",
         });
       }
 
@@ -5845,7 +5732,7 @@ app.post(
       }
 
       /*
-       * Trusted system instructions.
+       * Trusted system instructions (kept short for speed).
        */
       const instructions =
         buildCampusMartAiInstructions({
@@ -5858,303 +5745,178 @@ app.post(
         });
 
       /*
-       * First Responses API call.
+       * Chat Completions API — faster and better supported
+       * for gpt-4o-mini than the Responses API path.
        */
-      let response =
-        await openai.responses.create(
+      const chatMessages = [
+        {
+          role: "system",
+          content: instructions,
+        },
+        ...normalizedConversation.map(
+          (m) => ({
+            role:
+              m.role === "assistant"
+                ? "assistant"
+                : "user",
+            content: m.content,
+          })
+        ),
+      ];
+
+      let completion =
+        await openai.chat.completions.create(
           {
-            model:
-              CAMPUSMART_AI_MODEL,
-
-            instructions,
-
-            input:
-              normalizedConversation,
-
-            tools:
-              campusMartAiTools,
+            model: CAMPUSMART_AI_MODEL,
+            messages: chatMessages,
+            tools: campusMartAiTools,
+            tool_choice: "auto",
+            temperature: 0.4,
+            max_tokens: 450,
           }
         );
 
-      /*
-       * Tool execution loop.
-       *
-       * AI may ask for:
-       * - products
-       * - gigs
-       * - orders
-       *
-       * We execute those on the server using the authenticated
-       * Firebase user.
-       */
       let finalProducts = [];
       let finalGigs = [];
 
-      for (
-        let round = 0;
-        round < 3;
-        round++
-      ) {
+      /*
+       * At most 2 tool rounds (keeps replies fast).
+       */
+      for (let round = 0; round < 2; round++) {
+        const msg =
+          completion?.choices?.[0]?.message;
+
         const toolCalls =
-          Array.isArray(
-            response?.output
-          )
-            ? response.output.filter(
-                (item) =>
-                  item &&
-                  item.type ===
-                    "function_call"
-              )
+          Array.isArray(msg?.tool_calls)
+            ? msg.tool_calls
             : [];
 
-        if (
-          toolCalls.length === 0
-        ) {
+        if (!toolCalls.length) {
           break;
         }
 
-        const toolOutputs =
-          [];
+        chatMessages.push({
+          role: "assistant",
+          content: msg.content || null,
+          tool_calls: toolCalls,
+        });
 
-        for (
-          const toolCall of toolCalls
-        ) {
+        for (const toolCall of toolCalls) {
           const toolName =
-            toolCall.name;
+            toolCall?.function?.name ||
+            "";
 
           let args = {};
 
           try {
-            args =
-              toolCall.arguments
-                ? JSON.parse(
-                    toolCall.arguments
-                  )
-                : {};
+            args = toolCall?.function?.arguments
+              ? JSON.parse(
+                  toolCall.function.arguments
+                )
+              : {};
           } catch {
             args = {};
           }
 
+          let toolResult = {
+            success: false,
+            error: "Unknown tool.",
+          };
+
           try {
-            /*
-             * -----------------------------------------------
-             * PRODUCT SEARCH
-             * -----------------------------------------------
-             */
-            if (
-              toolName ===
-              "search_products"
-            ) {
+            if (toolName === "search_products") {
               const products =
                 await searchCampusMartProducts(
                   args
                 );
 
-              finalProducts =
-                products;
+              finalProducts = products;
 
-              const compactProducts =
-                products.map(
+              toolResult = {
+                success: true,
+                count: products.length,
+                products: products.map(
                   (p) => ({
                     id: p.id,
                     name: p.name,
                     price: p.price,
                     sellerName:
-                      p.sellerName ||
-                      null,
+                      p.sellerName || null,
                     location:
                       p.location ||
                       p.campus ||
                       null,
                     category:
-                      p.category ||
-                      null,
+                      p.category || null,
                   })
-                );
-
-              toolOutputs.push({
-                type:
-                  "function_call_output",
-
-                call_id:
-                  toolCall.call_id,
-
-                output:
-                  JSON.stringify({
-                    success:
-                      true,
-
-                    count:
-                      compactProducts.length,
-
-                    products:
-                      compactProducts,
-                  }),
-              });
-
-              continue;
-            }
-
-            /*
-             * -----------------------------------------------
-             * GIG SEARCH
-             * -----------------------------------------------
-             */
-            if (
-              toolName ===
-              "search_gigs"
-            ) {
+                ),
+              };
+            } else if (toolName === "search_gigs") {
               const gigs =
                 await searchCampusMartGigs(
                   args
                 );
 
-              finalGigs =
-                gigs;
+              finalGigs = gigs;
 
-              const compactGigs =
-                gigs.map(
-                  (g) => ({
-                    id: g.id,
-                    title: g.title,
-                    budget: g.budget,
-                    location:
-                      g.location ||
-                      null,
-                    category:
-                      g.category ||
-                      null,
-                    description:
-                      String(
-                        g.description ||
-                          ""
-                      ).slice(0, 120),
-                  })
-                );
-
-              toolOutputs.push({
-                type:
-                  "function_call_output",
-
-                call_id:
-                  toolCall.call_id,
-
-                output:
-                  JSON.stringify({
-                    success:
-                      true,
-
-                    count:
-                      compactGigs.length,
-
-                    gigs:
-                      compactGigs,
-                  }),
-              });
-
-              continue;
-            }
-
-            /*
-             * -----------------------------------------------
-             * OWN ORDERS
-             * -----------------------------------------------
-             */
-            if (
-              toolName ===
-              "get_my_orders"
-            ) {
+              toolResult = {
+                success: true,
+                count: gigs.length,
+                gigs: gigs.map((g) => ({
+                  id: g.id,
+                  title: g.title,
+                  budget: g.budget,
+                  location:
+                    g.location || null,
+                  category:
+                    g.category || null,
+                  description: String(
+                    g.description || ""
+                  ).slice(0, 100),
+                })),
+              };
+            } else if (toolName === "get_my_orders") {
               const orders =
                 await getMyCampusMartOrders(
                   uid
                 );
 
-              toolOutputs.push({
-                type:
-                  "function_call_output",
-
-                call_id:
-                  toolCall.call_id,
-
-                output:
-                  JSON.stringify({
-                    success:
-                      true,
-
-                    count:
-                      orders.length,
-
-                    orders,
-                  }),
-              });
-
-              continue;
+              toolResult = {
+                success: true,
+                count: orders.length,
+                orders: orders.slice(0, 10),
+              };
             }
-
-            /*
-             * Unknown tool
-             */
-            toolOutputs.push({
-              type:
-                "function_call_output",
-
-              call_id:
-                toolCall.call_id,
-
-              output:
-                JSON.stringify({
-                  success:
-                    false,
-
-                  error:
-                    "Unknown CampusMart AI tool.",
-                }),
-            });
           } catch (toolError) {
             console.error(
               `CampusMart AI tool error (${toolName}):`,
               toolError
             );
 
-            toolOutputs.push({
-              type:
-                "function_call_output",
-
-              call_id:
-                toolCall.call_id,
-
-              output:
-                JSON.stringify({
-                  success:
-                    false,
-
-                  error:
-                    toolError.message ||
-                    "Tool execution failed.",
-                }),
-            });
+            toolResult = {
+              success: false,
+              error:
+                toolError.message ||
+                "Tool failed.",
+            };
           }
+
+          chatMessages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(toolResult),
+          });
         }
 
-        /*
-         * Send tool results back to OpenAI.
-         */
-        response =
-          await openai.responses.create(
+        completion =
+          await openai.chat.completions.create(
             {
-              model:
-                CAMPUSMART_AI_MODEL,
-
-              instructions,
-
-              previous_response_id:
-                response.id,
-
-              input:
-                toolOutputs,
-
-              tools:
-                campusMartAiTools,
+              model: CAMPUSMART_AI_MODEL,
+              messages: chatMessages,
+              tools: campusMartAiTools,
+              tool_choice: "auto",
+              temperature: 0.4,
+              max_tokens: 450,
             }
           );
       }
@@ -6164,7 +5926,8 @@ app.post(
        */
       const reply =
         String(
-          response?.output_text ||
+          completion?.choices?.[0]?.message
+            ?.content ||
             ""
         ).trim();
 
@@ -6269,11 +6032,22 @@ app.post(
       const status =
         error?.status ||
         error?.statusCode ||
+        error?.response?.status ||
         500;
 
       let message =
         error?.message ||
+        error?.error?.message ||
         "CampusMart AI request failed.";
+
+      console.error(
+        "CampusMart AI raw error:",
+        {
+          status,
+          message,
+          model: CAMPUSMART_AI_MODEL,
+        }
+      );
 
       const lower =
         String(message).toLowerCase();
@@ -6290,7 +6064,22 @@ app.post(
         return res.status(429).json({
           success: false,
           error:
-            "CampusMart AI is busy right now (usage limit reached). Please wait a minute and try again.",
+            "CampusMart AI is busy right now (usage limit reached). Please wait about a minute and try again. If this keeps happening, check your OpenAI plan or try again later.",
+        });
+      }
+
+      if (
+        lower.includes("model") &&
+        (
+          lower.includes("not found") ||
+          lower.includes("does not exist") ||
+          lower.includes("invalid")
+        )
+      ) {
+        return res.status(500).json({
+          success: false,
+          error:
+            "CampusMart AI model is not available. Set GEMINI_AI_MODEL to a model your key can use (e.g. gemini-2.0-flash or gemini-1.5-flash).",
         });
       }
 
@@ -6300,6 +6089,7 @@ app.post(
       if (
         status >= 500 ||
         lower.includes("openai") ||
+        lower.includes("xai") ||
         lower.includes("api")
       ) {
         message =
@@ -6332,6 +6122,18 @@ app.listen(
 
     console.log(
       `Frontend URL: ${FRONTEND_URL}`
+    );
+
+    console.log(
+      `CampusMart AI provider: Google Gemini`
+    );
+
+    console.log(
+      `CampusMart AI model: ${CAMPUSMART_AI_MODEL}`
+    );
+
+    console.log(
+      `CampusMart AI base URL: ${GEMINI_BASE_URL}`
     );
   }
 );
