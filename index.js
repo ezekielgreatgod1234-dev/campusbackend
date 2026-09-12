@@ -34,7 +34,7 @@ const OPENAI_API_KEY =
 
 const CAMPUSMART_AI_MODEL =
   process.env.OPENAI_AI_MODEL ||
-  "gpt-4o-mini";
+  "gpt-4.1-mini";
 
 const openai = OPENAI_API_KEY
   ? new OpenAI({
@@ -4303,7 +4303,11 @@ async function searchCampusMartProducts(
     ["watch", "watches", "smartwatch", "smartwatches"],
     ["tablet", "tablets", "ipad", "ipads"],
     ["book", "books", "textbook", "textbooks", "novel", "novels"],
-    ["clothes", "clothing", "dress", "dresses", "shirt", "shirts", "trouser", "trousers", "jean", "jeans"],
+    ["clothes", "clothing", "dress", "dresses", "shirt", "shirts", "trouser", "trousers", "jean", "jeans", "fashion", "apparel"],
+    ["food", "foods", "meal", "meals", "snack", "snacks", "drink", "drinks", "beverage", "beverages", "grocery", "groceries", "edible", "cuisine", "cooking", "restaurant", "rice", "beans", "soup", "bread", "chicken", "fish", "meat", "fruit", "fruits", "vegetable", "vegetables", "shawarma", "pizza", "burger", "noodles", "pasta", "jollof", "swallow", "semo", "pounded", "yam", "plantain", "egg", "eggs", "milk", "juice", "water", "softdrink", "soft-drink"],
+    ["cosmetic", "cosmetics", "makeup", "skincare", "beauty", "cream", "lotion", "perfume", "perfumes"],
+    ["furniture", "chair", "chairs", "table", "tables", "bed", "mattress"],
+    ["appliance", "appliances", "fridge", "freezer", "kettle", "blender", "microwave", "iron", "fan", "fans"],
   ];
 
   const synonymMap = new Map();
@@ -4627,62 +4631,88 @@ async function searchCampusMartProducts(
       continue;
     }
 
-    const searchableText =
+    /*
+     * Match ONLY on product content — never on seller name alone.
+     * Otherwise a food query can pull phones from a seller who also sells food.
+     */
+    const nameText =
+      String(
+        product.name || ""
+      ).toLowerCase();
+
+    const categoryText =
+      String(
+        product.category || ""
+      ).toLowerCase();
+
+    const descriptionText =
+      String(
+        product.description || ""
+      ).toLowerCase();
+
+    const tagsText =
+      data.tags
+        ? (
+            Array.isArray(data.tags)
+              ? data.tags.join(" ")
+              : String(data.tags)
+          ).toLowerCase()
+        : "";
+
+    const brandText =
+      data.brand
+        ? String(data.brand).toLowerCase()
+        : "";
+
+    const productText =
       [
-        product.name,
-        product.category,
-        product.description,
-        product.location,
-        product.campus,
-        product.sellerName,
-        data.tags
-          ? (
-              Array.isArray(data.tags)
-                ? data.tags.join(" ")
-                : String(data.tags)
-            )
-          : "",
-        data.brand
-          ? String(data.brand)
-          : "",
+        nameText,
+        categoryText,
+        descriptionText,
+        tagsText,
+        brandText,
       ]
         .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
+        .join(" ");
 
     let score = 0;
+    let matchedOnProduct = false;
 
     if (isBrowseRequest) {
       score = 1;
+      matchedOnProduct = true;
     } else if (queryWords.length) {
-      const nameText =
-        String(
-          product.name || ""
-        ).toLowerCase();
-
-      const categoryText =
-        String(
-          product.category || ""
-        ).toLowerCase();
-
       for (const word of queryWords) {
+        if (!word || word.length < 2) {
+          continue;
+        }
+
         if (nameText.includes(word)) {
-          score += 12;
-        } else if (
-          categoryText.includes(word)
-        ) {
+          score += 20;
+          matchedOnProduct = true;
+        }
+
+        if (categoryText.includes(word)) {
+          score += 18;
+          matchedOnProduct = true;
+        }
+
+        if (tagsText.includes(word)) {
+          score += 14;
+          matchedOnProduct = true;
+        }
+
+        if (descriptionText.includes(word)) {
           score += 8;
-        } else if (
-          searchableText.includes(word)
-        ) {
-          score += 4;
+          matchedOnProduct = true;
+        }
+
+        if (brandText.includes(word)) {
+          score += 10;
+          matchedOnProduct = true;
         }
       }
 
-      /*
-       * Bonus if the original meaningful phrase
-       * appears as a whole in the name.
-       */
       const phrase =
         meaningfulTokens.join(" ");
 
@@ -4690,20 +4720,30 @@ async function searchCampusMartProducts(
         phrase &&
         nameText.includes(phrase)
       ) {
-        score += 15;
+        score += 25;
+        matchedOnProduct = true;
+      }
+
+      if (
+        phrase &&
+        categoryText.includes(phrase)
+      ) {
+        score += 22;
+        matchedOnProduct = true;
       }
     } else {
       score = 1;
+      matchedOnProduct = true;
     }
 
     /*
-     * Keep products that match at least one keyword.
-     * For browse requests, keep everything that passed filters.
+     * Strict filter: product fields must match the query.
+     * Do not include unrelated items just because the seller sells something else.
      */
     if (
       !isBrowseRequest &&
       queryWords.length &&
-      score <= 0
+      !matchedOnProduct
     ) {
       continue;
     }
@@ -4725,115 +4765,11 @@ async function searchCampusMartProducts(
   );
 
   /*
-   * If a specific query matched nothing, do a soft
-   * fallback: return a few active products so the AI
-   * can still be helpful instead of saying "none".
-   * Mark them so the model can explain they are general.
+   * No soft-fallback of unrelated products.
+   * If the user asked for food, only food (or nothing) is returned.
    */
-  if (
-    !results.length &&
-    !isBrowseRequest &&
-    docs.length
-  ) {
-    const fallback = [];
-
-    for (const docSnap of docs) {
-      const data =
-        docSnap.data() || {};
-
-      const rawStatus =
-        String(
-          firstExistingValue(
-            data,
-            [
-              "status",
-              "availability",
-              "productStatus",
-            ],
-            "active"
-          )
-        ).toLowerCase();
-
-      if (
-        [
-          "deleted",
-          "removed",
-          "inactive",
-          "unavailable",
-          "sold",
-          "draft",
-          "rejected",
-          "banned",
-        ].includes(rawStatus)
-      ) {
-        continue;
-      }
-
-      const sellerId =
-        firstExistingValue(
-          data,
-          [
-            "sellerId",
-            "sellerUid",
-            "sellerID",
-            "userId",
-            "ownerId",
-          ],
-          null
-        );
-
-      const sellerData =
-        sellerId
-          ? sellerMap.get(
-              String(sellerId)
-            ) || {}
-          : {};
-
-      const product =
-        normalizeProduct(
-          docSnap,
-          sellerData
-        );
-
-      if (
-        maxPrice !== null &&
-        (
-          product.price === null ||
-          product.price > maxPrice
-        )
-      ) {
-        continue;
-      }
-
-      if (
-        minPrice !== null &&
-        (
-          product.price === null ||
-          product.price < minPrice
-        )
-      ) {
-        continue;
-      }
-
-      fallback.push(product);
-
-      if (fallback.length >= 8) {
-        break;
-      }
-    }
-
-    if (fallback.length) {
-      console.log(
-        "CampusMart product search soft-fallback:",
-        fallback.length
-      );
-
-      return fallback;
-    }
-  }
-
   return results
-    .slice(0, 8)
+    .slice(0, 12)
     .map(
       ({
         _score,
@@ -5459,6 +5395,7 @@ PRODUCT / GIG SEARCH
 - Respect price limits (e.g. under ₦500,000 → maxPrice 500000).
 - After results: summarize in plain language, use ₦, mention seller when present, let the app show cards.
 - Only say nothing is available when the tool returns an empty list.
+- Never mix categories: if the user asked for food, only discuss food results. If they asked for phones, only phones. Do not suggest unrelated items from the same seller.
 
 STYLE
 - Warm, friendly, and upbeat — like a helpful campus buddy, not a robot.
