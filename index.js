@@ -5461,13 +5461,287 @@ PRODUCT / GIG SEARCH
 - Only say nothing is available when the tool returns an empty list.
 
 STYLE
-- Friendly, concise, campus-focused, practical.
-- Short paragraphs or bullets. No "As an AI".
-- Talk like a helpful campus assistant, not an engineer or admin.
+- Warm, friendly, and upbeat — like a helpful campus buddy, not a robot.
+- Use the user's first name naturally sometimes (not every sentence).
+- Short paragraphs or bullets. Light emoji is fine (1–2 max when it fits).
+- Sound encouraging: "Let's find you something nice", "I've got you", etc.
+- No "As an AI". No stiff corporate tone.
+- Talk only about using CampusMart as a student (buy, sell, gigs, orders).
 
-You are currently assisting ${firstName || "the user"}.
+MEMORY
+- Conversations may be restored when the user returns.
+- If they seem to be continuing an old chat, be natural — no need to restart from zero.
+- Never mention how memory or storage works.
+
+You are currently assisting ${firstName || "the user"}. Make them feel welcome.
 `;
 }
+
+/*
+ * ---------------------------------------------------------
+ * AI CONVERSATION MEMORY
+ * Stored per user in Firestore: aiConversations/{uid}
+ * Used so returning users keep context and get a warm welcome.
+ * ---------------------------------------------------------
+ */
+
+const AI_HISTORY_LIMIT = 40;
+
+function serializeAiMessagesForStore(messages) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+
+  return messages
+    .filter(
+      (m) =>
+        m &&
+        (m.role === "user" ||
+          m.role === "ai" ||
+          m.role === "assistant")
+    )
+    .map((m, index) => {
+      const role =
+        m.role === "assistant" || m.role === "ai"
+          ? "ai"
+          : "user";
+
+      return {
+        id:
+          String(
+            m.id ||
+              `${role}-${index}-${Date.now()}`
+          ).slice(0, 80),
+
+        role,
+
+        text: String(
+          m.text ||
+            m.content ||
+            ""
+        ).slice(0, 4000),
+
+        products:
+          role === "ai" &&
+          Array.isArray(m.products)
+            ? m.products.slice(0, 12)
+            : [],
+
+        gigs:
+          role === "ai" &&
+          Array.isArray(m.gigs)
+            ? m.gigs.slice(0, 12)
+            : [],
+
+        createdAt:
+          m.createdAt ||
+          new Date().toISOString(),
+      };
+    })
+    .filter((m) => m.text.trim().length > 0)
+    .slice(-AI_HISTORY_LIMIT);
+}
+
+async function loadAiConversation(uid) {
+  if (!uid) {
+    return null;
+  }
+
+  try {
+    const snap =
+      await db
+        .collection("aiConversations")
+        .doc(uid)
+        .get();
+
+    if (!snap.exists) {
+      return null;
+    }
+
+    const data =
+      snap.data() || {};
+
+    return {
+      messages:
+        serializeAiMessagesForStore(
+          data.messages || []
+        ),
+
+      updatedAt:
+        data.updatedAt || null,
+
+      firstName:
+        data.firstName || null,
+    };
+  } catch (error) {
+    console.error(
+      "AI conversation load error:",
+      error.message
+    );
+
+    return null;
+  }
+}
+
+async function saveAiConversation({
+  uid,
+  firstName,
+  messages,
+}) {
+  if (!uid) {
+    return;
+  }
+
+  const clean =
+    serializeAiMessagesForStore(
+      messages
+    );
+
+  try {
+    await db
+      .collection("aiConversations")
+      .doc(uid)
+      .set(
+        {
+          messages: clean,
+
+          firstName:
+            firstName || null,
+
+          updatedAt:
+            FieldValue.serverTimestamp(),
+
+          messageCount:
+            clean.length,
+        },
+        {
+          merge: true,
+        }
+      );
+  } catch (error) {
+    console.error(
+      "AI conversation save error:",
+      error.message
+    );
+  }
+}
+
+/*
+ * ---------------------------------------------------------
+ * AI HISTORY (load saved chat)
+ * ---------------------------------------------------------
+ */
+
+app.get(
+  "/ai/history",
+  async (req, res) => {
+    try {
+      const decoded =
+        await verifyFirebaseUser(
+          req
+        );
+
+      const uid =
+        decoded.uid;
+
+      if (!uid) {
+        return res.status(401).json({
+          success: false,
+          error:
+            "Please log in to use CampusMart AI.",
+        });
+      }
+
+      const stored =
+        await loadAiConversation(
+          uid
+        );
+
+      if (
+        !stored ||
+        !stored.messages.length
+      ) {
+        return res.json({
+          success: true,
+
+          hasHistory: false,
+
+          returningAfter24h: false,
+
+          messages: [],
+        });
+      }
+
+      let updatedMs =
+        null;
+
+      if (
+        stored.updatedAt &&
+        typeof stored.updatedAt.toDate ===
+          "function"
+      ) {
+        updatedMs =
+          stored.updatedAt
+            .toDate()
+            .getTime();
+      } else if (
+        stored.updatedAt
+      ) {
+        updatedMs =
+          new Date(
+            stored.updatedAt
+          ).getTime();
+      }
+
+      const hoursSince =
+        updatedMs
+          ? (Date.now() - updatedMs) /
+            (1000 * 60 * 60)
+          : null;
+
+      const returningAfter24h =
+        hoursSince !== null &&
+        hoursSince >= 24;
+
+      return res.json({
+        success: true,
+
+        hasHistory: true,
+
+        returningAfter24h,
+
+        hoursSince:
+          hoursSince !== null
+            ? Math.round(
+                hoursSince * 10
+              ) / 10
+            : null,
+
+        messages:
+          stored.messages,
+
+        firstName:
+          stored.firstName ||
+          null,
+      });
+    } catch (error) {
+      console.error(
+        "AI history error:",
+        error
+      );
+
+      return res.status(
+        error.status || 500
+      ).json({
+        success: false,
+        error:
+          error.message ||
+          "Could not load chat history.",
+      });
+    }
+  }
+);
+
 
 /*
  * ---------------------------------------------------------
@@ -5923,6 +6197,65 @@ app.post(
           error:
             "CampusMart AI could not generate a reply. Please try again.",
         });
+      }
+
+      /*
+       * Persist conversation so the user can continue later.
+       */
+      try {
+        const historyForStore = [
+          ...normalizedConversation.map(
+            (m) => ({
+              role:
+                m.role === "assistant"
+                  ? "ai"
+                  : m.role,
+
+              text: m.content,
+
+              products: [],
+
+              gigs: [],
+            })
+          ),
+
+          {
+            role: "ai",
+
+            text: reply,
+
+            products:
+              Array.isArray(
+                finalProducts
+              )
+                ? finalProducts
+                : [],
+
+            gigs:
+              Array.isArray(
+                finalGigs
+              )
+                ? finalGigs
+                : [],
+
+            createdAt:
+              new Date().toISOString(),
+          },
+        ];
+
+        await saveAiConversation({
+          uid,
+
+          firstName,
+
+          messages:
+            historyForStore,
+        });
+      } catch (saveErr) {
+        console.error(
+          "AI save after chat failed:",
+          saveErr.message
+        );
       }
 
       /*
