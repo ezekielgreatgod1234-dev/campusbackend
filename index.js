@@ -42,7 +42,7 @@ const CAMPUSMART_AI_MODEL =
   process.env.GEMINI_AI_MODEL ||
   process.env.GROK_AI_MODEL ||
   process.env.OPENAI_AI_MODEL ||
-  "gemini-2.0-flash";
+  "gemini-1.5-flash";
 
 const GEMINI_BASE_URL =
   process.env.GEMINI_BASE_URL ||
@@ -5255,8 +5255,12 @@ const campusMartAiTools = [
         "REQUIRED when the user asks about their own orders or purchases. Never invent orders.",
       parameters: {
         type: "object",
-        properties: {},
-        additionalProperties: false,
+        properties: {
+          reason: {
+            type: "string",
+            description: "Optional short reason, e.g. order status.",
+          },
+        },
       },
     },
   },
@@ -5764,17 +5768,52 @@ app.post(
         ),
       ];
 
-      let completion =
-        await openai.chat.completions.create(
-          {
-            model: CAMPUSMART_AI_MODEL,
-            messages: chatMessages,
-            tools: campusMartAiTools,
-            tool_choice: "auto",
-            temperature: 0.4,
-            max_tokens: 450,
-          }
+      let completion;
+
+      try {
+        completion =
+          await openai.chat.completions.create(
+            {
+              model: CAMPUSMART_AI_MODEL,
+              messages: chatMessages,
+              tools: campusMartAiTools,
+              tool_choice: "auto",
+              temperature: 0.4,
+              max_tokens: 450,
+            }
+          );
+      } catch (firstErr) {
+        /*
+         * If tools are rejected by the provider, retry once without tools
+         * so the user still gets a helpful reply.
+         */
+        const firstMsg = String(
+          firstErr?.message || ""
+        ).toLowerCase();
+
+        console.error(
+          "CampusMart AI first call failed:",
+          firstErr?.message || firstErr
         );
+
+        if (
+          firstMsg.includes("tool") ||
+          firstMsg.includes("function") ||
+          firstMsg.includes("schema")
+        ) {
+          completion =
+            await openai.chat.completions.create(
+              {
+                model: CAMPUSMART_AI_MODEL,
+                messages: chatMessages,
+                temperature: 0.4,
+                max_tokens: 450,
+              }
+            );
+        } else {
+          throw firstErr;
+        }
+      }
 
       let finalProducts = [];
       let finalGigs = [];
@@ -6038,6 +6077,7 @@ app.post(
       let message =
         error?.message ||
         error?.error?.message ||
+        error?.response?.data?.error?.message ||
         "CampusMart AI request failed.";
 
       console.error(
@@ -6046,25 +6086,49 @@ app.post(
           status,
           message,
           model: CAMPUSMART_AI_MODEL,
+          hasKey: Boolean(GEMINI_API_KEY),
+          baseURL: GEMINI_BASE_URL,
         }
       );
 
       const lower =
         String(message).toLowerCase();
 
-      /*
-       * Rate limit — friendly message, no provider dump.
-       */
+      if (!GEMINI_API_KEY) {
+        return res.status(503).json({
+          success: false,
+          error:
+            "CampusMart AI is not configured. Add GEMINI_API_KEY on the server (free key: https://aistudio.google.com/apikey).",
+        });
+      }
+
+      if (
+        status === 401 ||
+        status === 403 ||
+        lower.includes("api key") ||
+        lower.includes("api_key") ||
+        lower.includes("invalid key") ||
+        lower.includes("permission") ||
+        lower.includes("unauthorized") ||
+        lower.includes("unauthenticated")
+      ) {
+        return res.status(401).json({
+          success: false,
+          error:
+            "CampusMart AI key is invalid or missing access. Create a free Gemini key at https://aistudio.google.com/apikey and set GEMINI_API_KEY.",
+        });
+      }
+
       if (
         status === 429 ||
         lower.includes("rate limit") ||
-        lower.includes("tokens per min") ||
-        lower.includes("tpm")
+        lower.includes("quota") ||
+        lower.includes("resource exhausted")
       ) {
         return res.status(429).json({
           success: false,
           error:
-            "CampusMart AI is busy right now (usage limit reached). Please wait about a minute and try again. If this keeps happening, check your OpenAI plan or try again later.",
+            "CampusMart AI free limit was reached. Please wait a minute and try again.",
         });
       }
 
@@ -6073,27 +6137,31 @@ app.post(
         (
           lower.includes("not found") ||
           lower.includes("does not exist") ||
-          lower.includes("invalid")
+          lower.includes("invalid") ||
+          lower.includes("not supported")
         )
       ) {
         return res.status(500).json({
           success: false,
           error:
-            "CampusMart AI model is not available. Set GEMINI_AI_MODEL to a model your key can use (e.g. gemini-2.0-flash or gemini-1.5-flash).",
+            "That AI model is not available for your Gemini key. Set GEMINI_AI_MODEL=gemini-1.5-flash (or another model shown in Google AI Studio).",
         });
       }
 
       /*
-       * Hide unnecessary provider internals from users.
+       * Safe short message for users (no secrets).
+       * Keep useful short provider hints when they are readable.
        */
+      let userMessage =
+        "CampusMart AI is temporarily unavailable. Please try again.";
+
       if (
-        status >= 500 ||
-        lower.includes("openai") ||
-        lower.includes("xai") ||
-        lower.includes("api")
+        message &&
+        message.length < 160 &&
+        !lower.includes("sk-") &&
+        !lower.includes("aiza")
       ) {
-        message =
-          "CampusMart AI is temporarily unavailable. Please try again.";
+        userMessage = message;
       }
 
       return res
@@ -6104,7 +6172,7 @@ app.post(
         )
         .json({
           success: false,
-          error: message,
+          error: userMessage,
         });
     }
   }
