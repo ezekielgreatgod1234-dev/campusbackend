@@ -3999,6 +3999,21 @@ function numericValue(
     return fallback;
   }
 
+  if (typeof value === "string") {
+    const cleaned = value
+      .replace(/₦/g, "")
+      .replace(/NGN/gi, "")
+      .replace(/,/g, "")
+      .replace(/\s+/g, "")
+      .trim();
+
+    const number = Number(cleaned);
+
+    return Number.isFinite(number)
+      ? number
+      : fallback;
+  }
+
   const number = Number(value);
 
   return Number.isFinite(number)
@@ -4066,6 +4081,8 @@ function normalizeProduct(
         "sellerId",
         "sellerUid",
         "sellerID",
+        "userId",
+        "ownerId",
       ],
       null
     );
@@ -4225,7 +4242,7 @@ async function getUserProfileForAi(
 async function searchCampusMartProducts(
   args = {}
 ) {
-  const queryText =
+  const rawQuery =
     String(
       args.query || ""
     )
@@ -4256,13 +4273,109 @@ async function searchCampusMartProducts(
       .trim()
       .toLowerCase();
 
+  /*
+   * Stop words / generic phrases the model often sends
+   * that are not real product keywords.
+   */
+  const stopWords = new Set([
+    "a", "an", "the", "and", "or", "for", "to", "of", "in",
+    "on", "at", "is", "are", "me", "my", "i", "im", "i'm",
+    "find", "show", "search", "looking", "look", "want",
+    "need", "buy", "get", "see", "any", "available",
+    "currently", "something", "anything", "product",
+    "products", "item", "items", "goods", "please",
+    "under", "below", "above", "between", "cheap",
+    "affordable", "good", "best", "nice", "new", "used",
+    "campusmart", "campus", "mart", "naira", "ngn",
+  ]);
+
+  /*
+   * Expand common student-marketplace synonyms so
+   * "laptop" can match MacBook / HP / notebook titles.
+   */
+  const synonymGroups = [
+    ["laptop", "laptops", "notebook", "notebooks", "macbook", "macbooks", "chromebook", "chromebooks", "computer", "computers", "pc", "pcs"],
+    ["phone", "phones", "iphone", "iphones", "android", "samsung", "tecno", "infinix", "xiaomi", "mobile", "smartphone", "smartphones"],
+    ["headphone", "headphones", "earphone", "earphones", "earbud", "earbuds", "airpod", "airpods", "headset", "headsets"],
+    ["charger", "chargers", "cable", "cables", "adapter", "adapters", "powerbank", "powerbanks"],
+    ["shoe", "shoes", "sneaker", "sneakers", "sandal", "sandals", "footwear"],
+    ["bag", "bags", "backpack", "backpacks", "handbag", "handbags"],
+    ["watch", "watches", "smartwatch", "smartwatches"],
+    ["tablet", "tablets", "ipad", "ipads"],
+    ["book", "books", "textbook", "textbooks", "novel", "novels"],
+    ["clothes", "clothing", "dress", "dresses", "shirt", "shirts", "trouser", "trousers", "jean", "jeans"],
+  ];
+
+  const synonymMap = new Map();
+  for (const group of synonymGroups) {
+    for (const word of group) {
+      synonymMap.set(word, group);
+    }
+  }
+
+  function expandTokens(tokens) {
+    const expanded = new Set();
+    for (const token of tokens) {
+      if (!token || token.length < 2) continue;
+      expanded.add(token);
+      const group = synonymMap.get(token);
+      if (group) {
+        for (const s of group) {
+          expanded.add(s);
+        }
+      }
+    }
+    return Array.from(expanded);
+  }
+
+  const rawTokens =
+    rawQuery
+      .replace(/[₦$,]/g, " ")
+      .replace(/[^a-z0-9\s+.-]/gi, " ")
+      .split(/\s+/)
+      .map((w) => w.trim())
+      .filter(Boolean);
+
+  const meaningfulTokens =
+    rawTokens.filter(
+      (w) =>
+        !stopWords.has(w) &&
+        w.length >= 2 &&
+        !/^\d+(\.\d+)?$/.test(w)
+    );
+
+  const queryWords =
+    expandTokens(
+      meaningfulTokens.length
+        ? meaningfulTokens
+        : rawTokens.filter((w) => w.length >= 2)
+    );
+
+  /*
+   * True when the user is browsing generally
+   * ("anything available", "show products") rather than
+   * asking for a specific item.
+   */
+  const isBrowseRequest =
+    !meaningfulTokens.length ||
+    (
+      meaningfulTokens.length <= 1 &&
+      [
+        "all",
+        "list",
+        "browse",
+        "catalog",
+        "marketplace",
+      ].includes(meaningfulTokens[0] || "")
+    );
+
   let snapshot;
 
   try {
     snapshot =
       await db
         .collection("products")
-        .limit(250)
+        .limit(400)
         .get();
   } catch (error) {
     console.error(
@@ -4278,10 +4391,21 @@ async function searchCampusMartProducts(
   const docs =
     snapshot.docs;
 
-  /*
-   * We first collect seller IDs so we don't repeatedly
-   * request the same seller document.
-   */
+  console.log(
+    "CampusMart product search:",
+    {
+      rawQuery,
+      meaningfulTokens,
+      queryWords: queryWords.slice(0, 20),
+      isBrowseRequest,
+      totalDocs: docs.length,
+      minPrice,
+      maxPrice,
+      category,
+      campus,
+    }
+  );
+
   const sellerIds =
     new Set();
 
@@ -4297,6 +4421,8 @@ async function searchCampusMartProducts(
             "sellerId",
             "sellerUid",
             "sellerID",
+            "userId",
+            "ownerId",
           ],
           null
         );
@@ -4355,27 +4481,12 @@ async function searchCampusMartProducts(
     );
   }
 
-  const queryWords =
-    queryText
-      .split(/\s+/)
-      .map((word) =>
-        word.trim()
-      )
-      .filter(
-        (word) =>
-          word.length >= 2
-      );
-
   const results = [];
 
   for (const docSnap of docs) {
     const data =
       docSnap.data() || {};
 
-    /*
-     * Ignore obviously unavailable products when the schema
-     * explicitly marks them unavailable.
-     */
     const rawStatus =
       String(
         firstExistingValue(
@@ -4383,17 +4494,27 @@ async function searchCampusMartProducts(
           [
             "status",
             "availability",
+            "productStatus",
           ],
-          ""
+          "active"
         )
       ).toLowerCase();
 
+    /*
+     * Only skip clearly unavailable products.
+     * Missing / empty / "active" / "available" / "approved"
+     * should still be searchable.
+     */
     if (
       [
         "deleted",
         "removed",
         "inactive",
         "unavailable",
+        "sold",
+        "draft",
+        "rejected",
+        "banned",
       ].includes(
         rawStatus
       )
@@ -4408,6 +4529,8 @@ async function searchCampusMartProducts(
           "sellerId",
           "sellerUid",
           "sellerID",
+          "userId",
+          "ownerId",
         ],
         null
       );
@@ -4426,8 +4549,38 @@ async function searchCampusMartProducts(
       );
 
     /*
-     * PRICE FILTER
+     * Normalize price strings like "₦120,000" if needed.
      */
+    if (
+      product.price === null
+    ) {
+      const rawPrice =
+        firstExistingValue(
+          data,
+          [
+            "price",
+            "amount",
+            "sellingPrice",
+          ],
+          null
+        );
+
+      if (
+        typeof rawPrice === "string"
+      ) {
+        const cleaned =
+          rawPrice.replace(
+            /[^0-9.]/g,
+            ""
+          );
+
+        product.price =
+          numericValue(
+            cleaned
+          );
+      }
+    }
+
     if (
       minPrice !== null &&
       (
@@ -4450,9 +4603,6 @@ async function searchCampusMartProducts(
       continue;
     }
 
-    /*
-     * CATEGORY FILTER
-     */
     if (
       category &&
       !String(
@@ -4464,13 +4614,12 @@ async function searchCampusMartProducts(
       continue;
     }
 
-    /*
-     * CAMPUS FILTER
-     */
     if (
       campus &&
       !String(
-        product.location || ""
+        product.location ||
+          product.campus ||
+          ""
       )
         .toLowerCase()
         .includes(campus)
@@ -4478,16 +4627,24 @@ async function searchCampusMartProducts(
       continue;
     }
 
-    /*
-     * SEARCH RELEVANCE
-     */
     const searchableText =
       [
         product.name,
         product.category,
         product.description,
         product.location,
+        product.campus,
         product.sellerName,
+        data.tags
+          ? (
+              Array.isArray(data.tags)
+                ? data.tags.join(" ")
+                : String(data.tags)
+            )
+          : "",
+        data.brand
+          ? String(data.brand)
+          : "",
       ]
         .filter(Boolean)
         .join(" ")
@@ -4495,34 +4652,43 @@ async function searchCampusMartProducts(
 
     let score = 0;
 
-    if (queryText) {
-      if (
-        searchableText.includes(
-          queryText
-        )
-      ) {
-        score += 20;
-      }
-
-      for (const word of queryWords) {
-        if (
-          searchableText.includes(
-            word
-          )
-        ) {
-          score += 3;
-        }
-      }
-
+    if (isBrowseRequest) {
+      score = 1;
+    } else if (queryWords.length) {
       const nameText =
         String(
           product.name || ""
         ).toLowerCase();
 
+      const categoryText =
+        String(
+          product.category || ""
+        ).toLowerCase();
+
+      for (const word of queryWords) {
+        if (nameText.includes(word)) {
+          score += 12;
+        } else if (
+          categoryText.includes(word)
+        ) {
+          score += 8;
+        } else if (
+          searchableText.includes(word)
+        ) {
+          score += 4;
+        }
+      }
+
+      /*
+       * Bonus if the original meaningful phrase
+       * appears as a whole in the name.
+       */
+      const phrase =
+        meaningfulTokens.join(" ");
+
       if (
-        nameText.includes(
-          queryText
-        )
+        phrase &&
+        nameText.includes(phrase)
       ) {
         score += 15;
       }
@@ -4531,11 +4697,12 @@ async function searchCampusMartProducts(
     }
 
     /*
-     * If a query was supplied and nothing matches it,
-     * don't return completely unrelated products.
+     * Keep products that match at least one keyword.
+     * For browse requests, keep everything that passed filters.
      */
     if (
-      queryText &&
+      !isBrowseRequest &&
+      queryWords.length &&
       score <= 0
     ) {
       continue;
@@ -4551,6 +4718,119 @@ async function searchCampusMartProducts(
     (a, b) =>
       b._score - a._score
   );
+
+  console.log(
+    "CampusMart product search results:",
+    results.length
+  );
+
+  /*
+   * If a specific query matched nothing, do a soft
+   * fallback: return a few active products so the AI
+   * can still be helpful instead of saying "none".
+   * Mark them so the model can explain they are general.
+   */
+  if (
+    !results.length &&
+    !isBrowseRequest &&
+    docs.length
+  ) {
+    const fallback = [];
+
+    for (const docSnap of docs) {
+      const data =
+        docSnap.data() || {};
+
+      const rawStatus =
+        String(
+          firstExistingValue(
+            data,
+            [
+              "status",
+              "availability",
+              "productStatus",
+            ],
+            "active"
+          )
+        ).toLowerCase();
+
+      if (
+        [
+          "deleted",
+          "removed",
+          "inactive",
+          "unavailable",
+          "sold",
+          "draft",
+          "rejected",
+          "banned",
+        ].includes(rawStatus)
+      ) {
+        continue;
+      }
+
+      const sellerId =
+        firstExistingValue(
+          data,
+          [
+            "sellerId",
+            "sellerUid",
+            "sellerID",
+            "userId",
+            "ownerId",
+          ],
+          null
+        );
+
+      const sellerData =
+        sellerId
+          ? sellerMap.get(
+              String(sellerId)
+            ) || {}
+          : {};
+
+      const product =
+        normalizeProduct(
+          docSnap,
+          sellerData
+        );
+
+      if (
+        maxPrice !== null &&
+        (
+          product.price === null ||
+          product.price > maxPrice
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        minPrice !== null &&
+        (
+          product.price === null ||
+          product.price < minPrice
+        )
+      ) {
+        continue;
+      }
+
+      fallback.push(product);
+
+      if (fallback.length >= 8) {
+        break;
+      }
+    }
+
+    if (fallback.length) {
+      console.log(
+        "CampusMart product search soft-fallback:",
+        fallback.length
+      );
+
+      return fallback;
+    }
+  }
 
   return results
     .slice(0, 12)
@@ -4953,7 +5233,7 @@ const campusMartAiTools = [
     name: "search_products",
 
     description:
-      "REQUIRED for any product-related request. Search live CampusMart products in Firestore. Call this tool whenever the user asks to find, show, search for, compare, recommend, browse, or locate products, items, phones, laptops, clothes, or any goods on CampusMart. Also call it when the user mentions a product name or category even if they do not say the word search. Never invent product information. If results are empty, say so honestly.",
+      "REQUIRED for any product-related request. Search live CampusMart product listings. Call this whenever the user asks to find, show, search for, compare, recommend, browse, or locate products, items, phones, laptops, clothes, or any goods. Also call it when they mention a product name or category. Never invent product information. If results are empty, say so honestly.",
 
     parameters: {
       type: "object",
@@ -4962,7 +5242,7 @@ const campusMartAiTools = [
         query: {
           type: "string",
           description:
-            "Product keywords such as iPhone 13, laptop, headphones, charger, shoes, etc. Always provide at least one useful keyword.",
+            "Short product keywords only, e.g. laptop, iPhone 13, headphones, charger, shoes. Do NOT send full sentences. Prefer 1-3 words.",
         },
 
         minPrice: {
@@ -5000,7 +5280,7 @@ const campusMartAiTools = [
     name: "search_gigs",
 
     description:
-      "REQUIRED for any gig-related request. Search live CampusMart gigs in Firestore. Call this tool whenever the user asks to find, show, search, recommend, or browse gigs, jobs, tutoring, design work, repairs, or freelance services on CampusMart. Never invent gigs. If results are empty, say so honestly.",
+      "REQUIRED for any gig-related request. Search live CampusMart gig listings. Call this whenever the user asks to find, show, search, recommend, or browse gigs, jobs, tutoring, design work, repairs, or freelance services. Never invent gigs. If results are empty, say so honestly.",
 
     parameters: {
       type: "object",
@@ -5075,83 +5355,115 @@ function buildCampusMartAiInstructions({
   campus,
 }) {
   return `
-You are CampusMart AI, the official in-app assistant for CampusMart only.
+You are CampusMart AI, the friendly in-app assistant for CampusMart users.
 
-CampusMart is a Nigerian student marketplace. Users can buy and sell campus products, post and find gigs, message sellers, manage orders, and sellers can withdraw earnings. Payments run through Paystack in Nigerian Naira (₦).
+CampusMart is a student marketplace for Nigerian campuses. Students buy and sell products, post and find gigs, chat with sellers, manage orders, and sellers withdraw their earnings. Money is in Nigerian Naira (₦). Payments are completed securely in the app.
 
-ACCURACY RULE (MOST IMPORTANT):
-Your answers must be based on CampusMart — not generic shopping, Jumia, Amazon, or other marketplaces.
+==================================================
+WHAT YOU MAY TALK ABOUT (frontend / user experience)
+==================================================
 
-1. LIVE DATA (products, gigs, orders, prices, sellers, stock, availability):
-   - You MUST call the matching tool. Never guess or invent.
-   - search_products → any product / item / phone / laptop / clothing / "what is available" request
-   - search_gigs → any gig / job / tutoring / freelance request
-   - get_my_orders → the user's own orders or purchase history
-   - If a tool returns empty results, say clearly that nothing matching was found on CampusMart right now.
-   - Never invent product names, prices, sellers, locations, gigs, or order statuses.
+Help with everyday CampusMart use only:
 
-2. HOW-TO AND FEATURE QUESTIONS:
-   Answer only from the verified CampusMart facts below. If something is not listed, say you do not have verified information on that specific CampusMart policy or step, and suggest the user check the app screens (Products, Gigs, Orders, Profile, Seller dashboard) or contact support. Do not invent policies, fees, or workflows.
+- Finding and browsing products on campus
+- Product prices, sellers, and locations (from live search tools)
+- Buying / checkout flow from the buyer's point of view
+- Becoming a seller and posting products (user steps in the app)
+- Gigs: finding, posting, and applying in general terms
+- Orders the logged-in user asks about (via get_my_orders)
+- Profiles, campus, messaging sellers, promotions as a seller feature
+- How CampusMart works for students day to day
 
-VERIFIED CAMPUSMART FACTS (use these; do not invent beyond them):
-
-Account & identity
-- Sign-up and login use Firebase Authentication.
-- Users have profiles in CampusMart (name, email, campus/location, role).
-- Roles can include customer / seller / admin depending on the account.
+VERIFIED USER-FACING FACTS (use these; do not invent extra policies):
 
 Buying
-- Users browse products, open a product page, and checkout.
-- Payments are processed with Paystack in ₦ (Nigerian Naira).
-- After successful payment, order payment status is marked paid and the seller's available balance and total earnings are updated.
+- Browse products, open a product, then checkout in the app.
+- Pay in ₦. After a successful payment the order is marked paid.
+- You can ask about your own orders; the assistant uses live order data for you only.
 
 Selling
-- Users can become sellers and list products on CampusMart.
-- Sellers have availableBalance, totalEarnings, and can request withdrawals.
-- Minimum seller withdrawal amount is ₦1,000.
-- Withdrawals require bank details (account name, account number, bank code) and are sent via Paystack transfer. Status starts as Processing.
+- You can list products for other students to buy.
+- Sellers earn money from sales and can request a withdrawal from their available balance.
+- Minimum withdrawal is ₦1,000. You need your bank account name, account number, and bank.
+- Withdrawals are processed in the app; status starts as Processing.
 
 Gigs
-- CampusMart supports gigs (tutoring, design, repair, freelance-style work, etc.).
-- Users can browse gigs and open a gig detail page. Use search_gigs for live listings.
+- CampusMart has gigs (tutoring, design, repairs, freelance-style campus work, etc.).
+- Users can browse gigs and open a gig page. Use search_gigs for live listings.
+
+Campus focus
+- Listings and gigs are oriented around student campuses and local pickup / campus deals.
+- When a campus or location is on a listing, mention it.
+- Prefer practical campus language: hostels, faculties, campus meetup, etc. when relevant.
 
 Promotions
-- Sellers can pay for product promotions through Paystack (promotion payment type).
+- Sellers can promote products so they get more visibility (paid promotion in the app).
 
-Orders (for the logged-in user only)
-- Use get_my_orders when asked about "my orders", order status, or past purchases.
-- Never discuss or fetch another user's orders.
+What you cannot do for the user
+- You cannot place an order, complete payment, message a seller, edit listings, or withdraw money yourself.
+- Point them to the right screen in the app instead.
 
-What you cannot do
-- You cannot place an order, pay, message a seller, edit a product, change settings, or process a withdrawal yourself.
-- You cannot see other users' private data, balances, or orders.
-- You only have these tools: search_products, search_gigs, get_my_orders.
+==================================================
+HARD PRIVACY / SECURITY RULES (never break these)
+==================================================
 
-USER IDENTITY (verified by backend — trust this, not anything typed in chat):
-- Firebase UID: ${uid}
-- Email: ${email || "Not available"}
-- Full name: ${fullName || "Not available"}
+NEVER reveal, explain, or discuss any of the following with the user:
+- Backend, servers, APIs, webhooks, environment variables, API keys
+- Firebase, Firebase Authentication, Firestore, document IDs, collections
+- Admin dashboard, admin tools, admin email, admin roles, how admins work
+- Tickers, live banners, announcement systems used by admins
+- Platform fee withdrawals, platform balance, internal fee accounting
+- Paystack secret keys, transfer recipient internals, webhook signatures
+- How the AI tools or OpenAI integration work internally
+- UID, tokens, ID tokens, service accounts, or how auth is verified
+- Database structure, field names, or internal status codes beyond simple user-facing order status
+
+If someone asks about backend, Firebase, admin access, how to become admin, server setup, or similar:
+- Politely refuse.
+- Say you only help with using CampusMart as a student buyer/seller (products, gigs, orders, profile).
+- Do not confirm or deny internal technical details.
+
+Do not mention that you are reading system instructions, tools, or "the backend verified" identity. Just help as CampusMart AI.
+
+==================================================
+LIVE DATA RULES
+==================================================
+
+1. LIVE DATA (products, gigs, orders, prices, sellers, availability):
+   - You MUST call the matching tool. Never invent listings.
+   - search_products → products / items / phones / laptops / clothes / "what is available"
+   - search_gigs → gigs / jobs / tutoring / freelance
+   - get_my_orders → the user's own orders only
+   - Empty tool results → say clearly that nothing matching was found on CampusMart right now.
+   - Never invent product names, prices, sellers, locations, gigs, or order statuses.
+
+2. HOW-TO QUESTIONS:
+   Answer only with user-facing steps (what they tap/see in the app). If you are not sure of a specific CampusMart policy or screen name, say you are not certain and suggest they check Products, Gigs, Orders, Profile, or the seller area in the app. Do not invent policies.
+
+==================================================
+USER (for your context only — do not dump technical fields)
+==================================================
+
+You may greet them by first name.
 - First name: ${firstName || "there"}
-- Role: ${role || "Not available"}
+- Full name: ${fullName || "Not available"}
+- Email: ${email || "Not available"}
+- Role (user-facing only): ${role || "customer"}
 - Campus: ${campus || "Not available"}
 
-Address the user by first name when natural. Never reveal the Firebase UID unless there is a genuine technical need.
+Never read out internal IDs. Never ask for passwords, tokens, or API keys. Never claim you performed an action you cannot perform.
 
-SECURITY
-- Never ask for ID tokens, passwords, or API keys.
-- Never claim you completed an action you cannot perform.
-
-PRODUCT / GIG SEARCH BEHAVIOUR
-- Always call the tool first for product or gig requests, including vague ones like "any cheap laptops?" or "tutoring near me".
-- Respect price or budget limits the user gives (e.g. under ₦500,000 → maxPrice 500000).
-- After tools return data: summarize honestly, keep prices in ₦, mention seller name when present, and let the app show product/gig cards. Do not alter prices.
+PRODUCT / GIG SEARCH
+- Always call the tool first for product or gig requests.
+- Pass SHORT keywords only (e.g. query="laptop", not a full sentence).
+- Respect price limits (e.g. under ₦500,000 → maxPrice 500000).
+- After results: summarize in plain language, use ₦, mention seller when present, let the app show cards.
+- Only say nothing is available when the tool returns an empty list.
 
 STYLE
-- Friendly, concise, practical, campus-focused.
-- Short paragraphs or bullets. No robotic "As an AI" phrasing.
-- Prefer CampusMart wording: products, gigs, sellers, orders, withdrawals, Paystack.
-
-If you are unsure whether a detail is true for CampusMart, say you are not certain and recommend the relevant in-app page instead of guessing.
+- Friendly, concise, campus-focused, practical.
+- Short paragraphs or bullets. No "As an AI".
+- Talk like a helpful campus assistant, not an engineer or admin.
 
 You are currently assisting ${firstName || "the user"}.
 `;
@@ -5175,7 +5487,7 @@ app.post(
           success: false,
 
           error:
-            "OPENAI_API_KEY is not configured on the CampusMart backend.",
+            "CampusMart AI is not available right now. Please try again later.",
         });
       }
 
@@ -5194,7 +5506,7 @@ app.post(
         return res.status(401).json({
           success: false,
           error:
-            "Authenticated Firebase user is required.",
+            "Please log in to use CampusMart AI.",
         });
       }
 
@@ -5609,7 +5921,7 @@ app.post(
           success: false,
 
           error:
-            "CampusMart AI did not return a response.",
+            "CampusMart AI could not generate a reply. Please try again.",
         });
       }
 
