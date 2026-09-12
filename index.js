@@ -79,6 +79,40 @@ if (!GEMINI_API_KEY) {
   );
 }
 
+/*
+ * =====================================================
+ * AI QUOTA COOLDOWN CACHE
+ * =====================================================
+ * Once Gemini tells us we're rate-limited / out of quota,
+ * remember that in memory for a short cooldown window. Any
+ * /ai/chat request that comes in during that window gets the
+ * "limit reached" message back immediately (no auth lookup,
+ * no Firestore read, no call to Gemini) instead of waiting
+ * on another slow round-trip that's just going to fail the
+ * same way. This is what makes the limit message "show fast".
+ */
+const AI_QUOTA_COOLDOWN_MS = 60 * 1000; // 1 minute
+
+let aiQuotaCooldownUntil = 0;
+
+function markAiQuotaExceeded() {
+  aiQuotaCooldownUntil =
+    Date.now() + AI_QUOTA_COOLDOWN_MS;
+}
+
+function getAiQuotaCooldownSecondsLeft() {
+  return Math.max(
+    0,
+    Math.ceil(
+      (aiQuotaCooldownUntil - Date.now()) / 1000
+    )
+  );
+}
+
+function isAiQuotaOnCooldown() {
+  return Date.now() < aiQuotaCooldownUntil;
+}
+
 // =====================================================
 // CONFIG
 // =====================================================
@@ -6043,6 +6077,22 @@ app.post(
       }
 
       /*
+       * Fast path: if we already know we're rate-limited,
+       * return the limit message immediately instead of doing
+       * auth/Firestore work and waiting on another Gemini call
+       * that's just going to fail the same way.
+       */
+      if (isAiQuotaOnCooldown()) {
+        return res.status(429).json({
+          success: false,
+          error:
+            "CampusMart AI free limit was reached. Please wait a minute and try again.",
+          retryAfterSeconds:
+            getAiQuotaCooldownSecondsLeft(),
+        });
+      }
+
+      /*
        * Verify Firebase Authentication.
        */
       const decoded =
@@ -6658,10 +6708,14 @@ app.post(
         lower.includes("quota") ||
         lower.includes("resource exhausted")
       ) {
+        markAiQuotaExceeded();
+
         return res.status(429).json({
           success: false,
           error:
             "CampusMart AI free limit was reached. Please wait a minute and try again.",
+          retryAfterSeconds:
+            getAiQuotaCooldownSecondsLeft(),
         });
       }
 
