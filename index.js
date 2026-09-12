@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const crypto = require("crypto");
+const OpenAI = require("openai");
 
 const {
   initializeApp,
@@ -20,6 +21,32 @@ const {
 require("dotenv").config();
 
 const app = express();
+
+
+
+
+// =====================================================
+// OPENAI / CAMPUSMART AI
+// =====================================================
+
+const OPENAI_API_KEY =
+  process.env.OPENAI_API_KEY || "";
+
+const CAMPUSMART_AI_MODEL =
+  process.env.OPENAI_AI_MODEL ||
+  "gpt-5.6-luna";
+
+const openai = OPENAI_API_KEY
+  ? new OpenAI({
+      apiKey: OPENAI_API_KEY,
+    })
+  : null;
+
+if (!OPENAI_API_KEY) {
+  console.warn(
+    "OPENAI_API_KEY is missing — CampusMart AI will not work until it is configured."
+  );
+}
 
 // =====================================================
 // CONFIG
@@ -3885,6 +3912,1855 @@ app.get(
   }
 );
 
+
+
+
+// =====================================================
+// CAMPUSMART AI ASSISTANT
+// =====================================================
+
+/*
+ * CampusMart AI is intentionally authenticated.
+ *
+ * The frontend sends a Firebase ID token.
+ * The backend verifies that token using Firebase Admin.
+ *
+ * We NEVER trust a UID, name, email, role, or other identity
+ * information supplied by the browser.
+ */
+
+function cleanAiMessages(messages) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+
+  return messages
+    .filter(
+      (message) =>
+        message &&
+        (message.role === "user" ||
+          message.role === "assistant")
+    )
+    .map((message) => ({
+      role: message.role,
+      content: String(
+        message.content || ""
+      ).trim(),
+    }))
+    .filter(
+      (message) =>
+        message.content.length > 0
+    )
+    .slice(-20);
+}
+
+
+function firstExistingValue(
+  object,
+  keys,
+  fallback = null
+) {
+  if (!object || typeof object !== "object") {
+    return fallback;
+  }
+
+  for (const key of keys) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        object,
+        key
+      )
+    ) {
+      const value = object[key];
+
+      if (
+        value !== undefined &&
+        value !== null &&
+        value !== ""
+      ) {
+        return value;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+
+function numericValue(
+  value,
+  fallback = null
+) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return fallback;
+  }
+
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : fallback;
+}
+
+
+function normalizeProduct(
+  docSnap,
+  sellerData = {}
+) {
+  const data =
+    docSnap.data() || {};
+
+  const rawImages =
+    Array.isArray(data.images)
+      ? data.images
+      : [];
+
+  const image =
+    firstExistingValue(
+      data,
+      [
+        "image",
+        "imageUrl",
+        "imageURL",
+        "photoURL",
+        "thumbnail",
+        "coverImage",
+      ],
+      null
+    ) ||
+    rawImages[0] ||
+    null;
+
+  const name =
+    firstExistingValue(
+      data,
+      [
+        "name",
+        "title",
+        "productName",
+      ],
+      "CampusMart Product"
+    );
+
+  const price =
+    numericValue(
+      firstExistingValue(
+        data,
+        [
+          "price",
+          "amount",
+          "sellingPrice",
+        ],
+        null
+      )
+    );
+
+  const sellerId =
+    firstExistingValue(
+      data,
+      [
+        "sellerId",
+        "sellerUid",
+        "sellerID",
+      ],
+      null
+    );
+
+  const sellerName =
+    firstExistingValue(
+      data,
+      [
+        "sellerName",
+        "sellerDisplayName",
+        "vendorName",
+      ],
+      null
+    ) ||
+    firstExistingValue(
+      sellerData,
+      [
+        "fullName",
+        "displayName",
+        "name",
+      ],
+      "CampusMart Seller"
+    );
+
+  const location =
+    firstExistingValue(
+      data,
+      [
+        "location",
+        "campus",
+        "sellerCampus",
+      ],
+      null
+    ) ||
+    firstExistingValue(
+      sellerData,
+      [
+        "campus",
+        "location",
+        "address",
+      ],
+      null
+    );
+
+  const category =
+    firstExistingValue(
+      data,
+      [
+        "category",
+        "categoryName",
+        "type",
+      ],
+      null
+    );
+
+  const description =
+    firstExistingValue(
+      data,
+      [
+        "description",
+        "details",
+        "productDescription",
+      ],
+      ""
+    );
+
+  const stock =
+    numericValue(
+      firstExistingValue(
+        data,
+        [
+          "stock",
+          "quantity",
+          "availableQuantity",
+        ],
+        null
+      )
+    );
+
+  const status =
+    firstExistingValue(
+      data,
+      [
+        "status",
+        "availability",
+      ],
+      null
+    );
+
+  return {
+    id: docSnap.id,
+
+    name: String(name),
+
+    price,
+
+    image,
+
+    images: rawImages,
+
+    sellerId,
+
+    sellerName,
+
+    location,
+
+    campus:
+      location || null,
+
+    category,
+
+    description:
+      String(description || ""),
+
+    stock,
+
+    status,
+
+    url:
+      `/products/${docSnap.id}`,
+  };
+}
+
+
+async function getUserProfileForAi(
+  uid
+) {
+  if (!uid) {
+    return {};
+  }
+
+  try {
+    const userSnap =
+      await db
+        .collection("users")
+        .doc(uid)
+        .get();
+
+    if (!userSnap.exists) {
+      return {};
+    }
+
+    return (
+      userSnap.data() || {}
+    );
+  } catch (error) {
+    console.error(
+      "CampusMart AI user profile lookup error:",
+      error.message
+    );
+
+    return {};
+  }
+}
+
+
+async function searchCampusMartProducts(
+  args = {}
+) {
+  const queryText =
+    String(
+      args.query || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const minPrice =
+    numericValue(
+      args.minPrice
+    );
+
+  const maxPrice =
+    numericValue(
+      args.maxPrice
+    );
+
+  const category =
+    String(
+      args.category || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const campus =
+    String(
+      args.campus || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  let snapshot;
+
+  try {
+    snapshot =
+      await db
+        .collection("products")
+        .limit(250)
+        .get();
+  } catch (error) {
+    console.error(
+      "CampusMart product search error:",
+      error
+    );
+
+    throw new Error(
+      "Could not search CampusMart products."
+    );
+  }
+
+  const docs =
+    snapshot.docs;
+
+  /*
+   * We first collect seller IDs so we don't repeatedly
+   * request the same seller document.
+   */
+  const sellerIds =
+    new Set();
+
+  docs.forEach(
+    (docSnap) => {
+      const data =
+        docSnap.data() || {};
+
+      const sellerId =
+        firstExistingValue(
+          data,
+          [
+            "sellerId",
+            "sellerUid",
+            "sellerID",
+          ],
+          null
+        );
+
+      if (sellerId) {
+        sellerIds.add(
+          String(sellerId)
+        );
+      }
+    }
+  );
+
+  const sellerMap =
+    new Map();
+
+  const sellerIdArray =
+    Array.from(
+      sellerIds
+    );
+
+  for (
+    let i = 0;
+    i < sellerIdArray.length;
+    i += 10
+  ) {
+    const batch =
+      sellerIdArray.slice(
+        i,
+        i + 10
+      );
+
+    await Promise.all(
+      batch.map(
+        async (sellerId) => {
+          try {
+            const sellerSnap =
+              await db
+                .collection("users")
+                .doc(sellerId)
+                .get();
+
+            sellerMap.set(
+              sellerId,
+              sellerSnap.exists
+                ? sellerSnap.data() || {}
+                : {}
+            );
+          } catch {
+            sellerMap.set(
+              sellerId,
+              {}
+            );
+          }
+        }
+      )
+    );
+  }
+
+  const queryWords =
+    queryText
+      .split(/\s+/)
+      .map((word) =>
+        word.trim()
+      )
+      .filter(
+        (word) =>
+          word.length >= 2
+      );
+
+  const results = [];
+
+  for (const docSnap of docs) {
+    const data =
+      docSnap.data() || {};
+
+    /*
+     * Ignore obviously unavailable products when the schema
+     * explicitly marks them unavailable.
+     */
+    const rawStatus =
+      String(
+        firstExistingValue(
+          data,
+          [
+            "status",
+            "availability",
+          ],
+          ""
+        )
+      ).toLowerCase();
+
+    if (
+      [
+        "deleted",
+        "removed",
+        "inactive",
+        "unavailable",
+      ].includes(
+        rawStatus
+      )
+    ) {
+      continue;
+    }
+
+    const sellerId =
+      firstExistingValue(
+        data,
+        [
+          "sellerId",
+          "sellerUid",
+          "sellerID",
+        ],
+        null
+      );
+
+    const sellerData =
+      sellerId
+        ? sellerMap.get(
+            String(sellerId)
+          ) || {}
+        : {};
+
+    const product =
+      normalizeProduct(
+        docSnap,
+        sellerData
+      );
+
+    /*
+     * PRICE FILTER
+     */
+    if (
+      minPrice !== null &&
+      (
+        product.price === null ||
+        product.price <
+          minPrice
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      maxPrice !== null &&
+      (
+        product.price === null ||
+        product.price >
+          maxPrice
+      )
+    ) {
+      continue;
+    }
+
+    /*
+     * CATEGORY FILTER
+     */
+    if (
+      category &&
+      !String(
+        product.category || ""
+      )
+        .toLowerCase()
+        .includes(category)
+    ) {
+      continue;
+    }
+
+    /*
+     * CAMPUS FILTER
+     */
+    if (
+      campus &&
+      !String(
+        product.location || ""
+      )
+        .toLowerCase()
+        .includes(campus)
+    ) {
+      continue;
+    }
+
+    /*
+     * SEARCH RELEVANCE
+     */
+    const searchableText =
+      [
+        product.name,
+        product.category,
+        product.description,
+        product.location,
+        product.sellerName,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+    let score = 0;
+
+    if (queryText) {
+      if (
+        searchableText.includes(
+          queryText
+        )
+      ) {
+        score += 20;
+      }
+
+      for (const word of queryWords) {
+        if (
+          searchableText.includes(
+            word
+          )
+        ) {
+          score += 3;
+        }
+      }
+
+      const nameText =
+        String(
+          product.name || ""
+        ).toLowerCase();
+
+      if (
+        nameText.includes(
+          queryText
+        )
+      ) {
+        score += 15;
+      }
+    } else {
+      score = 1;
+    }
+
+    /*
+     * If a query was supplied and nothing matches it,
+     * don't return completely unrelated products.
+     */
+    if (
+      queryText &&
+      score <= 0
+    ) {
+      continue;
+    }
+
+    results.push({
+      ...product,
+      _score: score,
+    });
+  }
+
+  results.sort(
+    (a, b) =>
+      b._score - a._score
+  );
+
+  return results
+    .slice(0, 12)
+    .map(
+      ({
+        _score,
+        ...product
+      }) => product
+    );
+}
+
+
+async function searchCampusMartGigs(
+  args = {}
+) {
+  const queryText =
+    String(
+      args.query || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const category =
+    String(
+      args.category || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const campus =
+    String(
+      args.campus || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const minBudget =
+    numericValue(
+      args.minBudget
+    );
+
+  const maxBudget =
+    numericValue(
+      args.maxBudget
+    );
+
+  let snapshot;
+
+  try {
+    snapshot =
+      await db
+        .collection("gigs")
+        .limit(150)
+        .get();
+  } catch (error) {
+    console.error(
+      "CampusMart gig search error:",
+      error
+    );
+
+    throw new Error(
+      "Could not search CampusMart gigs."
+    );
+  }
+
+  const results = [];
+
+  for (
+    const docSnap of snapshot.docs
+  ) {
+    const data =
+      docSnap.data() || {};
+
+    const title =
+      firstExistingValue(
+        data,
+        [
+          "title",
+          "name",
+          "gigTitle",
+        ],
+        "Campus Gig"
+      );
+
+    const description =
+      firstExistingValue(
+        data,
+        [
+          "description",
+          "details",
+          "gigDescription",
+        ],
+        ""
+      );
+
+    const gigCategory =
+      firstExistingValue(
+        data,
+        [
+          "category",
+          "type",
+          "gigCategory",
+        ],
+        ""
+      );
+
+    const location =
+      firstExistingValue(
+        data,
+        [
+          "location",
+          "campus",
+        ],
+        ""
+      );
+
+    const budget =
+      numericValue(
+        firstExistingValue(
+          data,
+          [
+            "budget",
+            "price",
+            "amount",
+          ],
+          null
+        )
+      );
+
+    const status =
+      String(
+        firstExistingValue(
+          data,
+          [
+            "status",
+            "availability",
+          ],
+          ""
+        )
+      ).toLowerCase();
+
+    if (
+      [
+        "deleted",
+        "removed",
+        "inactive",
+        "closed",
+      ].includes(status)
+    ) {
+      continue;
+    }
+
+    if (
+      minBudget !== null &&
+      (
+        budget === null ||
+        budget < minBudget
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      maxBudget !== null &&
+      (
+        budget === null ||
+        budget > maxBudget
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      category &&
+      !String(
+        gigCategory
+      )
+        .toLowerCase()
+        .includes(category)
+    ) {
+      continue;
+    }
+
+    if (
+      campus &&
+      !String(
+        location
+      )
+        .toLowerCase()
+        .includes(campus)
+    ) {
+      continue;
+    }
+
+    const searchableText =
+      [
+        title,
+        description,
+        gigCategory,
+        location,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+    let score = 0;
+
+    if (queryText) {
+      if (
+        searchableText.includes(
+          queryText
+        )
+      ) {
+        score += 20;
+      }
+
+      const words =
+        queryText
+          .split(/\s+/)
+          .filter(
+            (word) =>
+              word.length >= 2
+          );
+
+      for (const word of words) {
+        if (
+          searchableText.includes(
+            word
+          )
+        ) {
+          score += 3;
+        }
+      }
+    } else {
+      score = 1;
+    }
+
+    if (
+      queryText &&
+      score <= 0
+    ) {
+      continue;
+    }
+
+    results.push({
+      id: docSnap.id,
+
+      title: String(title),
+
+      description:
+        String(
+          description || ""
+        ),
+
+      category:
+        gigCategory || null,
+
+      location:
+        location || null,
+
+      budget,
+
+      url:
+        `/gigs/${docSnap.id}`,
+
+      _score: score,
+    });
+  }
+
+  results.sort(
+    (a, b) =>
+      b._score - a._score
+  );
+
+  return results
+    .slice(0, 12)
+    .map(
+      ({
+        _score,
+        ...gig
+      }) => gig
+    );
+}
+
+
+async function getMyCampusMartOrders(
+  uid
+) {
+  if (!uid) {
+    throw new Error(
+      "Authenticated user is required."
+    );
+  }
+
+  let snapshot;
+
+  try {
+    snapshot =
+      await db
+        .collection("orders")
+        .where(
+          "buyerId",
+          "==",
+          uid
+        )
+        .limit(20)
+        .get();
+  } catch (error) {
+    console.error(
+      "CampusMart order lookup error:",
+      error
+    );
+
+    throw new Error(
+      "Could not retrieve your CampusMart orders."
+    );
+  }
+
+  return snapshot.docs.map(
+    (docSnap) => {
+      const data =
+        docSnap.data() || {};
+
+      const items =
+        Array.isArray(
+          data.items
+        )
+          ? data.items
+          : [];
+
+      return {
+        id: docSnap.id,
+
+        orderNumber:
+          data.orderNumber ||
+          data.orderId ||
+          docSnap.id,
+
+        status:
+          data.status ||
+          "Unknown",
+
+        paymentStatus:
+          data.paymentStatus ||
+          "Unknown",
+
+        total:
+          numericValue(
+            data.total,
+            0
+          ),
+
+        createdAt:
+          data.createdAt?.toDate
+            ? data.createdAt
+                .toDate()
+                .toISOString()
+            : data.createdAt ||
+              null,
+
+        items:
+          items
+            .slice(0, 20)
+            .map(
+              (item) => ({
+                name:
+                  item?.name ||
+                  item?.productName ||
+                  "Product",
+
+                quantity:
+                  numericValue(
+                    item?.quantity,
+                    1
+                  ),
+
+                price:
+                  numericValue(
+                    item?.price,
+                    null
+                  ),
+              })
+            ),
+      };
+    }
+  );
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * OPENAI TOOLS
+ * ---------------------------------------------------------
+ */
+
+const campusMartAiTools = [
+  {
+    type: "function",
+
+    name: "search_products",
+
+    description:
+      "Search live CampusMart products in Firestore. Use this whenever the user asks to find, show, search for, compare, recommend, or locate products on CampusMart. Never invent product information.",
+
+    parameters: {
+      type: "object",
+
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Product keywords such as iPhone 13, laptop, headphones, charger, shoes, etc.",
+        },
+
+        minPrice: {
+          type: "number",
+          description:
+            "Minimum price in Nigerian Naira.",
+        },
+
+        maxPrice: {
+          type: "number",
+          description:
+            "Maximum price in Nigerian Naira.",
+        },
+
+        category: {
+          type: "string",
+          description:
+            "Product category if the user specifies one.",
+        },
+
+        campus: {
+          type: "string",
+          description:
+            "Campus or location if the user specifies one.",
+        },
+      },
+
+      required: ["query"],
+    },
+  },
+
+  {
+    type: "function",
+
+    name: "search_gigs",
+
+    description:
+      "Search live CampusMart gigs in Firestore. Use this whenever the user asks to find, show, search, or recommend CampusMart gigs or temporary jobs.",
+
+    parameters: {
+      type: "object",
+
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Gig keywords such as tutoring, graphic design, phone repair, programming, etc.",
+        },
+
+        category: {
+          type: "string",
+          description:
+            "Gig category.",
+        },
+
+        campus: {
+          type: "string",
+          description:
+            "Campus or location.",
+        },
+
+        minBudget: {
+          type: "number",
+          description:
+            "Minimum gig budget in Nigerian Naira.",
+        },
+
+        maxBudget: {
+          type: "number",
+          description:
+            "Maximum gig budget in Nigerian Naira.",
+        },
+      },
+
+      required: ["query"],
+    },
+  },
+
+  {
+    type: "function",
+
+    name: "get_my_orders",
+
+    description:
+      "Retrieve the authenticated CampusMart user's own orders. Use this only when the user asks about their orders, order history, order status, or purchases.",
+
+    parameters: {
+      type: "object",
+
+      properties: {},
+
+      additionalProperties: false,
+    },
+  },
+];
+
+
+/*
+ * ---------------------------------------------------------
+ * CAMPUSMART AI SYSTEM PROMPT
+ * ---------------------------------------------------------
+ */
+
+function buildCampusMartAiInstructions({
+  uid,
+  fullName,
+  firstName,
+  email,
+  role,
+  campus,
+}) {
+  return `
+You are CampusMart AI, the official AI assistant inside the CampusMart marketplace.
+
+CampusMart is a student-focused marketplace where users can discover products, buy products, sell products, post gigs, discover gigs, communicate with sellers, manage orders, manage profiles, and use other CampusMart services.
+
+YOUR MAIN JOB:
+Help the authenticated CampusMart user understand and use CampusMart.
+
+You can answer CampusMart questions about:
+- creating an account
+- logging in
+- becoming a seller
+- posting products
+- editing products
+- buying products
+- finding products
+- product prices
+- sellers
+- seller stores
+- orders
+- payments
+- checkout
+- gigs
+- posting gigs
+- finding gigs
+- profiles
+- settings
+- messaging
+- withdrawals
+- seller earnings
+- promotions
+- general CampusMart functionality
+
+IMPORTANT DATA RULE:
+Never invent live CampusMart information.
+
+Never invent:
+- products
+- product prices
+- sellers
+- seller names
+- seller locations
+- gigs
+- gig prices
+- orders
+- order statuses
+- fees
+- balances
+- policies
+- availability
+
+If the user asks for live CampusMart products, use the search_products tool.
+
+If the user asks for live CampusMart gigs, use the search_gigs tool.
+
+If the user asks about their own orders, use get_my_orders.
+
+If a tool returns no matching result, clearly tell the user that no matching live CampusMart data was found.
+
+Do not create fake examples and present them as actual CampusMart listings.
+
+USER IDENTITY:
+The backend has verified the Firebase Authentication identity.
+
+Authenticated Firebase UID:
+${uid}
+
+Authenticated email:
+${email || "Not available"}
+
+CampusMart full name:
+${fullName || "Not available"}
+
+First name:
+${firstName || "there"}
+
+CampusMart role:
+${role || "Not available"}
+
+Campus:
+${campus || "Not available"}
+
+You may naturally address the user by their first name when appropriate.
+
+SECURITY:
+Never reveal the Firebase UID to the user unless there is a legitimate technical reason.
+
+Never ask the user to provide their Firebase ID token.
+
+Never ask the user to provide their OpenAI API key.
+
+Never claim to have performed an action that you cannot actually perform.
+
+For example, do not claim that you purchased an item, transferred money, changed an account setting, contacted a seller, or cancelled an order unless a real tool exists for that action and it was actually executed.
+
+PRODUCT SEARCH:
+When users ask for products, search the live CampusMart database.
+
+Respect price limits.
+
+For example:
+"Find an iPhone 13 under ₦500,000"
+
+should use search_products with:
+query = iPhone 13
+maxPrice = 500000
+
+After receiving product results:
+- explain what you found
+- use Nigerian Naira
+- do not change the actual database price
+- mention the actual seller when available
+- let the frontend display product cards
+
+If no products match, say so honestly.
+
+GENERAL QUESTIONS:
+You should answer naturally rather than requiring the user to use exact commands.
+
+For example:
+"How do I become a seller?"
+"Can I sell my old laptop?"
+"How do I post a product?"
+"What happens after I buy something?"
+"How do I contact a seller?"
+
+Answer based on the CampusMart functionality you actually know from the system.
+
+If you do not have enough verified information about a specific CampusMart policy or feature, say that you do not have verified information instead of inventing it.
+
+ORDERS:
+When the user asks about their own orders, use get_my_orders.
+
+Never expose another user's orders.
+
+Only return order information belonging to the authenticated user.
+
+If there are no orders, say that no orders were found.
+
+STYLE:
+Be friendly, concise, useful, and natural.
+
+Do not sound robotic.
+
+Use simple language.
+
+Use bullet points when helpful.
+
+Do not repeatedly say "As an AI".
+
+You are an assistant inside CampusMart, so focus on helping the user complete their CampusMart task.
+
+CURRENCY:
+CampusMart uses Nigerian Naira.
+
+Use ₦ when displaying Nigerian prices.
+
+Do not convert a live CampusMart price into another currency unless the user explicitly asks.
+
+CURRENT USER:
+You are currently assisting ${firstName || "the user"}.
+`;
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * AI CHAT ENDPOINT
+ * ---------------------------------------------------------
+ */
+
+app.post(
+  "/ai/chat",
+  async (req, res) => {
+    try {
+      /*
+       * OpenAI configuration check
+       */
+      if (!openai) {
+        return res.status(503).json({
+          success: false,
+
+          error:
+            "OPENAI_API_KEY is not configured on the CampusMart backend.",
+        });
+      }
+
+      /*
+       * Verify Firebase Authentication.
+       */
+      const decoded =
+        await verifyFirebaseUser(
+          req
+        );
+
+      const uid =
+        decoded.uid;
+
+      if (!uid) {
+        return res.status(401).json({
+          success: false,
+          error:
+            "Authenticated Firebase user is required.",
+        });
+      }
+
+      /*
+       * Get trusted Firestore profile information.
+       */
+      const userProfile =
+        await getUserProfileForAi(
+          uid
+        );
+
+      const fullName =
+        String(
+          firstExistingValue(
+            userProfile,
+            [
+              "fullName",
+              "displayName",
+              "name",
+            ],
+            decoded.name || ""
+          ) || ""
+        ).trim();
+
+      const firstName =
+        (
+          fullName ||
+          decoded.name ||
+          decoded.email?.split("@")?.[0] ||
+          "there"
+        )
+          .split(/\s+/)[0];
+
+      const role =
+        firstExistingValue(
+          userProfile,
+          [
+            "role",
+          ],
+          decoded.role ||
+            "customer"
+        );
+
+      const campus =
+        firstExistingValue(
+          userProfile,
+          [
+            "campus",
+            "school",
+            "university",
+            "location",
+          ],
+          null
+        );
+
+      const email =
+        decoded.email ||
+        userProfile.email ||
+        "";
+
+      /*
+       * Validate the current message.
+       */
+      const userMessage =
+        String(
+          req.body?.message || ""
+        ).trim();
+
+      if (!userMessage) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "message is required.",
+        });
+      }
+
+      /*
+       * Clean conversation history.
+       */
+      const previousMessages =
+        cleanAiMessages(
+          req.body?.messages
+        );
+
+      /*
+       * Make sure the current message exists at the end
+       * even if the frontend history is incomplete.
+       */
+      const conversation = [
+        ...previousMessages,
+        {
+          role: "user",
+          content: userMessage,
+        },
+      ].slice(-20);
+
+      /*
+       * Remove immediately duplicated current user message
+       * if the frontend already included it.
+       */
+      const normalizedConversation =
+        [];
+
+      for (
+        const message of conversation
+      ) {
+        const previous =
+          normalizedConversation[
+            normalizedConversation.length - 1
+          ];
+
+        if (
+          previous &&
+          previous.role ===
+            message.role &&
+          previous.content ===
+            message.content
+        ) {
+          continue;
+        }
+
+        normalizedConversation.push(
+          message
+        );
+      }
+
+      /*
+       * Trusted system instructions.
+       */
+      const instructions =
+        buildCampusMartAiInstructions({
+          uid,
+          fullName,
+          firstName,
+          email,
+          role,
+          campus,
+        });
+
+      /*
+       * First Responses API call.
+       */
+      let response =
+        await openai.responses.create(
+          {
+            model:
+              CAMPUSMART_AI_MODEL,
+
+            instructions,
+
+            input:
+              normalizedConversation,
+
+            tools:
+              campusMartAiTools,
+          }
+        );
+
+      /*
+       * Tool execution loop.
+       *
+       * AI may ask for:
+       * - products
+       * - gigs
+       * - orders
+       *
+       * We execute those on the server using the authenticated
+       * Firebase user.
+       */
+      let finalProducts = [];
+      let finalGigs = [];
+
+      for (
+        let round = 0;
+        round < 3;
+        round++
+      ) {
+        const toolCalls =
+          Array.isArray(
+            response?.output
+          )
+            ? response.output.filter(
+                (item) =>
+                  item &&
+                  item.type ===
+                    "function_call"
+              )
+            : [];
+
+        if (
+          toolCalls.length === 0
+        ) {
+          break;
+        }
+
+        const toolOutputs =
+          [];
+
+        for (
+          const toolCall of toolCalls
+        ) {
+          const toolName =
+            toolCall.name;
+
+          let args = {};
+
+          try {
+            args =
+              toolCall.arguments
+                ? JSON.parse(
+                    toolCall.arguments
+                  )
+                : {};
+          } catch {
+            args = {};
+          }
+
+          try {
+            /*
+             * -----------------------------------------------
+             * PRODUCT SEARCH
+             * -----------------------------------------------
+             */
+            if (
+              toolName ===
+              "search_products"
+            ) {
+              const products =
+                await searchCampusMartProducts(
+                  args
+                );
+
+              finalProducts =
+                products;
+
+              toolOutputs.push({
+                type:
+                  "function_call_output",
+
+                call_id:
+                  toolCall.call_id,
+
+                output:
+                  JSON.stringify({
+                    success:
+                      true,
+
+                    count:
+                      products.length,
+
+                    products,
+                  }),
+              });
+
+              continue;
+            }
+
+            /*
+             * -----------------------------------------------
+             * GIG SEARCH
+             * -----------------------------------------------
+             */
+            if (
+              toolName ===
+              "search_gigs"
+            ) {
+              const gigs =
+                await searchCampusMartGigs(
+                  args
+                );
+
+              finalGigs =
+                gigs;
+
+              toolOutputs.push({
+                type:
+                  "function_call_output",
+
+                call_id:
+                  toolCall.call_id,
+
+                output:
+                  JSON.stringify({
+                    success:
+                      true,
+
+                    count:
+                      gigs.length,
+
+                    gigs,
+                  }),
+              });
+
+              continue;
+            }
+
+            /*
+             * -----------------------------------------------
+             * OWN ORDERS
+             * -----------------------------------------------
+             */
+            if (
+              toolName ===
+              "get_my_orders"
+            ) {
+              const orders =
+                await getMyCampusMartOrders(
+                  uid
+                );
+
+              toolOutputs.push({
+                type:
+                  "function_call_output",
+
+                call_id:
+                  toolCall.call_id,
+
+                output:
+                  JSON.stringify({
+                    success:
+                      true,
+
+                    count:
+                      orders.length,
+
+                    orders,
+                  }),
+              });
+
+              continue;
+            }
+
+            /*
+             * Unknown tool
+             */
+            toolOutputs.push({
+              type:
+                "function_call_output",
+
+              call_id:
+                toolCall.call_id,
+
+              output:
+                JSON.stringify({
+                  success:
+                    false,
+
+                  error:
+                    "Unknown CampusMart AI tool.",
+                }),
+            });
+          } catch (toolError) {
+            console.error(
+              `CampusMart AI tool error (${toolName}):`,
+              toolError
+            );
+
+            toolOutputs.push({
+              type:
+                "function_call_output",
+
+              call_id:
+                toolCall.call_id,
+
+              output:
+                JSON.stringify({
+                  success:
+                    false,
+
+                  error:
+                    toolError.message ||
+                    "Tool execution failed.",
+                }),
+            });
+          }
+        }
+
+        /*
+         * Send tool results back to OpenAI.
+         */
+        response =
+          await openai.responses.create(
+            {
+              model:
+                CAMPUSMART_AI_MODEL,
+
+              instructions,
+
+              previous_response_id:
+                response.id,
+
+              input:
+                toolOutputs,
+
+              tools:
+                campusMartAiTools,
+            }
+          );
+      }
+
+      /*
+       * Extract final AI response.
+       */
+      const reply =
+        String(
+          response?.output_text ||
+            ""
+        ).trim();
+
+      if (!reply) {
+        return res.status(502).json({
+          success: false,
+
+          error:
+            "CampusMart AI did not return a response.",
+        });
+      }
+
+      /*
+       * Return only the information needed by the frontend.
+       */
+      return res.json({
+        success: true,
+
+        reply,
+
+        firstName,
+
+        products:
+          Array.isArray(
+            finalProducts
+          )
+            ? finalProducts
+            : [],
+
+        gigs:
+          Array.isArray(
+            finalGigs
+          )
+            ? finalGigs
+            : [],
+      });
+    } catch (error) {
+      console.error(
+        "CampusMart AI endpoint error:",
+        error
+      );
+
+      const status =
+        error?.status ||
+        error?.statusCode ||
+        500;
+
+      let message =
+        error?.message ||
+        "CampusMart AI request failed.";
+
+      /*
+       * Hide unnecessary provider internals from users.
+       */
+      if (
+        status >= 500 &&
+        (
+          message.includes(
+            "OpenAI"
+          ) ||
+          message.includes(
+            "API"
+          )
+        )
+      ) {
+        message =
+          "CampusMart AI is temporarily unavailable. Please try again.";
+      }
+
+      return res
+        .status(status)
+        .json({
+          success: false,
+          error: message,
+        });
+    }
+  }
+);
 // =====================================================
 // START SERVER
 // =====================================================
