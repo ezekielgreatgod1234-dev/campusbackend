@@ -42,19 +42,20 @@ const CAMPUSMART_AI_MODEL =
   process.env.GEMINI_AI_MODEL ||
   process.env.GROK_AI_MODEL ||
   process.env.OPENAI_AI_MODEL ||
-  "gemini-2.5-flash";
+  "gemini-3.6-flash";
 
 /*
  * If the configured model is unavailable, try these free-tier
- * Flash models in order (current as of 2026).
+ * Flash models in order (Google currently points new keys to 3.6+).
  */
 const GEMINI_MODEL_FALLBACKS = [
   CAMPUSMART_AI_MODEL,
-  "gemini-2.5-flash",
+  "gemini-3.6-flash",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.0-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-2.5-flash",
 ].filter(
   (name, index, arr) =>
     name && arr.indexOf(name) === index
@@ -5552,7 +5553,7 @@ app.get(
             lastError ||
             "No Gemini model responded.",
           help:
-            "Set GEMINI_AI_MODEL to a free model from AI Studio, e.g. gemini-2.5-flash or gemini-3.8-flash.",
+            "Set GEMINI_AI_MODEL=gemini-3.6-flash (Google recommendation for new API keys).",
         });
       }
 
@@ -6312,7 +6313,7 @@ app.post(
         return res.status(500).json({
           success: false,
           error:
-            "That AI model is not available for your Gemini key. Set GEMINI_AI_MODEL=gemini-2.5-flash or gemini-3.8-flash (models shown in Google AI Studio).",
+            "That AI model is not available for your Gemini key. Set GEMINI_AI_MODEL=gemini-3.6-flash (or gemini-3.8-flash).",
         });
       }
 
