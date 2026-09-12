@@ -34,7 +34,7 @@ const OPENAI_API_KEY =
 
 const CAMPUSMART_AI_MODEL =
   process.env.OPENAI_AI_MODEL ||
-  "gpt-5.6-luna";
+  "gpt-4o-mini";
 
 const openai = OPENAI_API_KEY
   ? new OpenAI({
@@ -3951,7 +3951,7 @@ function cleanAiMessages(messages) {
       (message) =>
         message.content.length > 0
     )
-    .slice(-20);
+    .slice(-10);
 }
 
 
@@ -4833,7 +4833,7 @@ async function searchCampusMartProducts(
   }
 
   return results
-    .slice(0, 12)
+    .slice(0, 8)
     .map(
       ({
         _score,
@@ -5106,7 +5106,7 @@ async function searchCampusMartGigs(
   );
 
   return results
-    .slice(0, 12)
+    .slice(0, 8)
     .map(
       ({
         _score,
@@ -5875,7 +5875,7 @@ app.post(
           role: "user",
           content: userMessage,
         },
-      ].slice(-20);
+      ].slice(-10);
 
       /*
        * Remove immediately duplicated current user message
@@ -6016,6 +6016,25 @@ app.post(
               finalProducts =
                 products;
 
+              const compactProducts =
+                products.map(
+                  (p) => ({
+                    id: p.id,
+                    name: p.name,
+                    price: p.price,
+                    sellerName:
+                      p.sellerName ||
+                      null,
+                    location:
+                      p.location ||
+                      p.campus ||
+                      null,
+                    category:
+                      p.category ||
+                      null,
+                  })
+                );
+
               toolOutputs.push({
                 type:
                   "function_call_output",
@@ -6029,9 +6048,10 @@ app.post(
                       true,
 
                     count:
-                      products.length,
+                      compactProducts.length,
 
-                    products,
+                    products:
+                      compactProducts,
                   }),
               });
 
@@ -6055,6 +6075,26 @@ app.post(
               finalGigs =
                 gigs;
 
+              const compactGigs =
+                gigs.map(
+                  (g) => ({
+                    id: g.id,
+                    title: g.title,
+                    budget: g.budget,
+                    location:
+                      g.location ||
+                      null,
+                    category:
+                      g.category ||
+                      null,
+                    description:
+                      String(
+                        g.description ||
+                          ""
+                      ).slice(0, 120),
+                  })
+                );
+
               toolOutputs.push({
                 type:
                   "function_call_output",
@@ -6068,9 +6108,10 @@ app.post(
                       true,
 
                     count:
-                      gigs.length,
+                      compactGigs.length,
 
-                    gigs,
+                    gigs:
+                      compactGigs,
                   }),
               });
 
@@ -6297,26 +6338,43 @@ app.post(
         error?.message ||
         "CampusMart AI request failed.";
 
+      const lower =
+        String(message).toLowerCase();
+
+      /*
+       * Rate limit — friendly message, no provider dump.
+       */
+      if (
+        status === 429 ||
+        lower.includes("rate limit") ||
+        lower.includes("tokens per min") ||
+        lower.includes("tpm")
+      ) {
+        return res.status(429).json({
+          success: false,
+          error:
+            "CampusMart AI is busy right now (usage limit reached). Please wait a minute and try again.",
+        });
+      }
+
       /*
        * Hide unnecessary provider internals from users.
        */
       if (
-        status >= 500 &&
-        (
-          message.includes(
-            "OpenAI"
-          ) ||
-          message.includes(
-            "API"
-          )
-        )
+        status >= 500 ||
+        lower.includes("openai") ||
+        lower.includes("api")
       ) {
         message =
           "CampusMart AI is temporarily unavailable. Please try again.";
       }
 
       return res
-        .status(status)
+        .status(
+          status >= 400 && status < 600
+            ? status
+            : 500
+        )
         .json({
           success: false,
           error: message,
