@@ -790,64 +790,105 @@ async function sendPushToUser(uid, { title, body, data } = {}) {
   }
 
   const user = snap.data() || {};
-  const token = String(user.fcmToken || "").trim();
-  const enabled = user.notificationsEnabled !== false; // default true if token exists
-
-  if (!token) {
-    return { ok: false, reason: "no_token" };
-  }
 
   if (user.notificationsEnabled === false) {
     return { ok: false, reason: "disabled" };
   }
 
-  const message = {
-    token,
-    notification: {
-      title: String(title || "CampusMart"),
-      body: String(body || "You have a new update"),
-    },
-    data: Object.fromEntries(
-      Object.entries(data || {}).map(([k, v]) => [
-        String(k),
-        v == null ? "" : String(v),
-      ])
-    ),
-    webpush: {
-      fcmOptions: {
-        // Opens app when notification is clicked (optional)
-        link: process.env.FRONTEND_URL || "https://campus-mart-ashen.vercel.app",
-      },
-    },
+  // Support multiple devices: fcmTokens[] + legacy single fcmToken
+  const tokenSet = new Set();
+  if (Array.isArray(user.fcmTokens)) {
+    user.fcmTokens.forEach((t) => {
+      const s = String(t || "").trim();
+      if (s) tokenSet.add(s);
+    });
+  }
+  const legacy = String(user.fcmToken || "").trim();
+  if (legacy) tokenSet.add(legacy);
+
+  const tokens = Array.from(tokenSet);
+  if (!tokens.length) {
+    return { ok: false, reason: "no_token" };
+  }
+
+  const notification = {
+    title: String(title || "CampusMart"),
+    body: String(body || "You have a new update"),
   };
 
-  try {
-    const messageId = await messaging.send(message);
-    return { ok: true, messageId };
-  } catch (err) {
-    const code = err?.code || err?.errorInfo?.code || "";
-    console.error("FCM send error:", code, err.message);
+  const dataPayload = Object.fromEntries(
+    Object.entries(data || {}).map(([k, v]) => [
+      String(k),
+      v == null ? "" : String(v),
+    ])
+  );
 
-    // Invalid / unregistered token → clear it so we stop retrying
-    if (
-      String(code).includes("registration-token-not-registered") ||
-      String(code).includes("invalid-argument") ||
-      String(err.message || "").toLowerCase().includes("not a valid fcm")
-    ) {
-      try {
-        await db.collection("users").doc(uid).set(
-          {
-            fcmToken: null,
-            notificationsEnabled: false,
-            fcmTokenUpdatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      } catch (_) {}
+  const link =
+    process.env.FRONTEND_URL || "https://campus-mart-ashen.vercel.app";
+
+  let sent = 0;
+  let failed = 0;
+  const invalidTokens = [];
+  let lastMessageId = null;
+
+  for (const token of tokens) {
+    try {
+      lastMessageId = await messaging.send({
+        token,
+        notification,
+        data: dataPayload,
+        webpush: {
+          fcmOptions: { link },
+        },
+      });
+      sent += 1;
+    } catch (err) {
+      failed += 1;
+      const code = err?.code || err?.errorInfo?.code || "";
+      console.error("FCM send error:", code, err.message);
+
+      if (
+        String(code).includes("registration-token-not-registered") ||
+        String(code).includes("invalid-registration-token") ||
+        String(code).includes("invalid-argument") ||
+        String(err.message || "").toLowerCase().includes("not a valid fcm")
+      ) {
+        invalidTokens.push(token);
+      }
     }
-
-    return { ok: false, reason: "fcm_error", error: err.message };
   }
+
+  // Remove dead tokens, keep the rest
+  if (invalidTokens.length) {
+    try {
+      const remaining = tokens.filter((t) => !invalidTokens.includes(t));
+      await db.collection("users").doc(uid).set(
+        {
+          fcmTokens: remaining,
+          fcmToken: remaining[0] || null,
+          notificationsEnabled: remaining.length > 0,
+          fcmTokenUpdatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (_) {}
+  }
+
+  if (sent === 0) {
+    return {
+      ok: false,
+      reason: "fcm_error",
+      error: "No device accepted the push",
+      failed,
+    };
+  }
+
+  return {
+    ok: true,
+    messageId: lastMessageId,
+    sent,
+    failed,
+  };
 }
 
 /**
