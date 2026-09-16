@@ -2229,6 +2229,27 @@ app.post(
         sellerAmount
       );
 
+      // Notify seller of new paid order (best-effort, don't fail webhook)
+      try {
+        if (sellerId) {
+          const orderLabel = orderId
+            ? `Order #${String(orderId).slice(0, 8).toUpperCase()}`
+            : "New order";
+          const amountLabel = `₦${Number(sellerAmount || 0).toLocaleString("en-NG")}`;
+          await sendPushToUser(sellerId, {
+            title: "New order on CampusMart",
+            body: `${orderLabel} — you earned ${amountLabel} (95% after fee). Open Orders to fulfill it.`,
+            data: {
+              type: "order",
+              orderId: orderId ? String(orderId) : "",
+              path: "/seller/orders",
+            },
+          });
+        }
+      } catch (pushErr) {
+        console.error("Order push notify error:", pushErr.message);
+      }
+
       return res
         .status(200)
         .send("OK");
@@ -6883,6 +6904,221 @@ app.post(
 // Body optional: { "title": "...", "body": "..." }
 // Auth: Bearer Firebase ID token
 // =====================================================
+
+
+// =====================================================
+// NOTIFY: NEW CHAT MESSAGE
+// Client calls this after writing a message to Firestore.
+// POST /notify-new-message
+// Body: { recipientId, senderName?, preview? }
+// Auth: Bearer (sender)
+// =====================================================
+
+app.post("/notify-new-message", async (req, res) => {
+  try {
+    const decoded = await verifyFirebaseUser(req);
+    const recipientId = String(req.body?.recipientId || "").trim();
+    const senderName = String(
+      req.body?.senderName || "Someone"
+    ).trim() || "Someone";
+    const preview = String(req.body?.preview || "sent you a message")
+      .trim()
+      .slice(0, 120);
+
+    if (!recipientId) {
+      return res.status(400).json({ error: "recipientId is required" });
+    }
+
+    if (recipientId === decoded.uid) {
+      return res.json({ success: true, skipped: "self" });
+    }
+
+    const result = await sendPushToUser(recipientId, {
+      title: senderName,
+      body: preview || "sent you a message on CampusMart",
+      data: {
+        type: "message",
+        senderId: decoded.uid,
+        path: "/messages",
+      },
+    });
+
+    return res.json({
+      success: true,
+      pushed: !!result.ok,
+      reason: result.reason || null,
+    });
+  } catch (error) {
+    console.error("notify-new-message error:", error);
+    return res.status(error.status || 500).json({
+      error: error.message || "Could not notify",
+    });
+  }
+});
+
+// =====================================================
+// NOTIFY: NEW RECOMMENDED / BOOSTED PRODUCT
+// Call when a product is posted as recommended OR boosted.
+// Does NOT notify for every normal product listing.
+// POST /notify-recommended-product
+// Body: { productId, productName?, sellerName? }
+// Auth: Bearer (seller)
+// =====================================================
+
+app.post("/notify-recommended-product", async (req, res) => {
+  try {
+    const decoded = await verifyFirebaseUser(req);
+    const productId = String(req.body?.productId || "").trim();
+    const productName = String(req.body?.productName || "A new product").trim();
+    const sellerName = String(req.body?.sellerName || "A seller").trim();
+
+    if (!productId) {
+      return res.status(400).json({ error: "productId is required" });
+    }
+
+    // Optional: only allow if product is boosted/recommended
+    let isFeatured = true;
+    try {
+      const pSnap = await db.collection("products").doc(productId).get();
+      if (pSnap.exists) {
+        const p = pSnap.data() || {};
+        const boosted =
+          p.isBoosted === true ||
+          p.boosted === true ||
+          p.isRecommended === true ||
+          p.recommended === true ||
+          (p.boostedUntil && new Date(p.boostedUntil.toDate?.() || p.boostedUntil) > new Date());
+        isFeatured = !!boosted;
+        // If seller owns it and explicitly asked notify, allow when body.force === true
+        if (req.body?.force === true && p.sellerId === decoded.uid) {
+          isFeatured = true;
+        }
+      }
+    } catch (_) {}
+
+    if (!isFeatured && req.body?.force !== true) {
+      return res.json({
+        success: true,
+        skipped: true,
+        reason: "not_recommended_or_boosted",
+      });
+    }
+
+    // Notify a limited set of recent buyers / all users with tokens (cap)
+    const usersSnap = await db
+      .collection("users")
+      .where("notificationsEnabled", "==", true)
+      .limit(200)
+      .get();
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const docSnap of usersSnap.docs) {
+      if (docSnap.id === decoded.uid) continue; // skip seller
+      const u = docSnap.data() || {};
+      if (!u.fcmToken) continue;
+
+      const result = await sendPushToUser(docSnap.id, {
+        title: "Recommended on CampusMart",
+        body: `${productName} from ${sellerName} — check it out`,
+        data: {
+          type: "product",
+          productId,
+          path: `/product/${productId}`,
+        },
+      });
+      if (result.ok) sent += 1;
+      else failed += 1;
+    }
+
+    return res.json({ success: true, sent, failed });
+  } catch (error) {
+    console.error("notify-recommended-product error:", error);
+    return res.status(error.status || 500).json({
+      error: error.message || "Could not notify",
+    });
+  }
+});
+
+// =====================================================
+// ADMIN: FEATURE / APP UPDATE PUSH (all users with tokens)
+// POST /admin/notify-feature
+// Body: { title, body }
+// =====================================================
+
+app.post("/admin/notify-feature", async (req, res) => {
+  try {
+    const decoded = await requireAdmin(req);
+    const title =
+      String(req.body?.title || "New on CampusMart").trim() ||
+      "New on CampusMart";
+    const body = String(req.body?.body || "").trim();
+
+    if (!body) {
+      return res.status(400).json({ error: "body is required" });
+    }
+
+    const usersSnap = await db
+      .collection("users")
+      .where("notificationsEnabled", "==", true)
+      .limit(500)
+      .get();
+
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const docSnap of usersSnap.docs) {
+      const u = docSnap.data() || {};
+      if (!u.fcmToken) {
+        skipped += 1;
+        continue;
+      }
+
+      const result = await sendPushToUser(docSnap.id, {
+        title,
+        body: body.slice(0, 180),
+        data: {
+          type: "feature",
+          path: "/",
+        },
+      });
+
+      if (result.ok) sent += 1;
+      else failed += 1;
+
+      // small delay to be gentle on FCM
+      await new Promise((r) => setTimeout(r, 30));
+    }
+
+    await db.collection("announcements").add({
+      title,
+      body,
+      type: "feature_push",
+      audience: "all_with_push",
+      sentCount: sent,
+      failedCount: failed,
+      createdBy: decoded.uid,
+      createdByEmail: decoded.email || null,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return res.json({
+      success: true,
+      sent,
+      failed,
+      skipped,
+      message: "Feature update push finished",
+    });
+  } catch (error) {
+    console.error("admin notify-feature error:", error);
+    return res.status(error.status || 500).json({
+      error: error.message || "Could not send feature pushes",
+    });
+  }
+});
+
 
 app.post("/send-test-push", async (req, res) => {
   try {
