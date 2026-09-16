@@ -777,7 +777,7 @@ async function publishPrivateTicker({
 
 /**
  * Send a web/mobile push to a single user by Firebase Auth UID.
- * Reads fcmToken from users/{uid}. Skips quietly if missing/disabled.
+ * Reads fcmTokens[] + legacy fcmToken from users/{uid}. Multi-device safe.
  */
 async function sendPushToUser(uid, { title, body, data } = {}) {
   if (!uid) {
@@ -839,6 +839,10 @@ async function sendPushToUser(uid, { title, body, data } = {}) {
         data: dataPayload,
         webpush: {
           fcmOptions: { link },
+          notification: {
+            ...notification,
+            icon: "/pwa-192x192.png",
+          },
         },
       });
       sent += 1;
@@ -7058,7 +7062,10 @@ app.post("/notify-recommended-product", async (req, res) => {
     for (const docSnap of usersSnap.docs) {
       if (docSnap.id === decoded.uid) continue; // skip seller
       const u = docSnap.data() || {};
-      if (!u.fcmToken) continue;
+      const hasToken =
+        (Array.isArray(u.fcmTokens) && u.fcmTokens.some((t) => String(t || "").trim())) ||
+        Boolean(String(u.fcmToken || "").trim());
+      if (!hasToken) continue;
 
       const result = await sendPushToUser(docSnap.id, {
         title: "Recommended on CampusMart",
@@ -7112,7 +7119,10 @@ app.post("/admin/notify-feature", async (req, res) => {
 
     for (const docSnap of usersSnap.docs) {
       const u = docSnap.data() || {};
-      if (!u.fcmToken) {
+      const hasToken =
+        (Array.isArray(u.fcmTokens) && u.fcmTokens.some((t) => String(t || "").trim())) ||
+        Boolean(String(u.fcmToken || "").trim());
+      if (!hasToken) {
         skipped += 1;
         continue;
       }
