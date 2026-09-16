@@ -18,6 +18,10 @@ const {
   getAuth,
 } = require("firebase-admin/auth");
 
+const {
+  getMessaging,
+} = require("firebase-admin/messaging");
+
 require("dotenv").config();
 
 const app = express();
@@ -199,6 +203,7 @@ initializeApp({
 
 const db = getFirestore();
 const adminAuth = getAuth();
+const messaging = getMessaging();
 
 // =====================================================
 // PAYSTACK
@@ -761,6 +766,105 @@ async function publishPrivateTicker({
         merge: true,
       }
     );
+}
+
+
+
+
+// =====================================================
+// FCM PUSH NOTIFICATIONS
+// =====================================================
+
+/**
+ * Send a web/mobile push to a single user by Firebase Auth UID.
+ * Reads fcmToken from users/{uid}. Skips quietly if missing/disabled.
+ */
+async function sendPushToUser(uid, { title, body, data } = {}) {
+  if (!uid) {
+    return { ok: false, reason: "missing_uid" };
+  }
+
+  const snap = await db.collection("users").doc(uid).get();
+  if (!snap.exists) {
+    return { ok: false, reason: "user_not_found" };
+  }
+
+  const user = snap.data() || {};
+  const token = String(user.fcmToken || "").trim();
+  const enabled = user.notificationsEnabled !== false; // default true if token exists
+
+  if (!token) {
+    return { ok: false, reason: "no_token" };
+  }
+
+  if (user.notificationsEnabled === false) {
+    return { ok: false, reason: "disabled" };
+  }
+
+  const message = {
+    token,
+    notification: {
+      title: String(title || "CampusMart"),
+      body: String(body || "You have a new update"),
+    },
+    data: Object.fromEntries(
+      Object.entries(data || {}).map(([k, v]) => [
+        String(k),
+        v == null ? "" : String(v),
+      ])
+    ),
+    webpush: {
+      fcmOptions: {
+        // Opens app when notification is clicked (optional)
+        link: process.env.FRONTEND_URL || "https://campus-mart-ashen.vercel.app",
+      },
+    },
+  };
+
+  try {
+    const messageId = await messaging.send(message);
+    return { ok: true, messageId };
+  } catch (err) {
+    const code = err?.code || err?.errorInfo?.code || "";
+    console.error("FCM send error:", code, err.message);
+
+    // Invalid / unregistered token → clear it so we stop retrying
+    if (
+      String(code).includes("registration-token-not-registered") ||
+      String(code).includes("invalid-argument") ||
+      String(err.message || "").toLowerCase().includes("not a valid fcm")
+    ) {
+      try {
+        await db.collection("users").doc(uid).set(
+          {
+            fcmToken: null,
+            notificationsEnabled: false,
+            fcmTokenUpdatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (_) {}
+    }
+
+    return { ok: false, reason: "fcm_error", error: err.message };
+  }
+}
+
+/**
+ * Send the same push to many UIDs (best-effort).
+ */
+async function sendPushToUsers(uids, payload) {
+  const list = Array.isArray(uids) ? uids.filter(Boolean) : [];
+  let sent = 0;
+  let failed = 0;
+
+  for (const uid of list) {
+    const result = await sendPushToUser(uid, payload);
+    if (result.ok) sent += 1;
+    else failed += 1;
+  }
+
+  return { sent, failed, total: list.length };
 }
 
 
@@ -6772,6 +6876,117 @@ app.post(
     }
   }
 );
+
+// =====================================================
+// TEST PUSH (logged-in user can test their own device)
+// POST /send-test-push
+// Body optional: { "title": "...", "body": "..." }
+// Auth: Bearer Firebase ID token
+// =====================================================
+
+app.post("/send-test-push", async (req, res) => {
+  try {
+    const decoded = await verifyFirebaseUser(req);
+    const uid = decoded.uid;
+
+    const title =
+      String(req.body?.title || "CampusMart").trim() ||
+      "CampusMart";
+    const body =
+      String(
+        req.body?.body ||
+          "Push notifications are working on this device."
+      ).trim() || "Push notifications are working on this device.";
+
+    const result = await sendPushToUser(uid, {
+      title,
+      body,
+      data: {
+        type: "test",
+        click_action: "FLUTTER_NOTIFICATION_CLICK",
+      },
+    });
+
+    if (!result.ok) {
+      return res.status(400).json({
+        success: false,
+        reason: result.reason,
+        error:
+          result.reason === "no_token"
+            ? "No FCM token on this account. Enable notifications in Settings first."
+            : result.reason === "disabled"
+              ? "Notifications are disabled for this account."
+              : result.error || "Could not send push",
+      });
+    }
+
+    return res.json({
+      success: true,
+      messageId: result.messageId,
+      message: "Test notification sent. Check this device.",
+    });
+  } catch (error) {
+    console.error("send-test-push error:", error);
+    return res.status(error.status || 500).json({
+      success: false,
+      error: error.message || "Could not send test push",
+    });
+  }
+});
+
+// =====================================================
+// ADMIN: SEND PUSH TO ONE USER BY EMAIL
+// POST /admin/send-push
+// Body: { "email": "...", "title": "...", "body": "..." }
+// =====================================================
+
+app.post("/admin/send-push", async (req, res) => {
+  try {
+    await requireAdmin(req);
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const title =
+      String(req.body?.title || "CampusMart").trim() || "CampusMart";
+    const body = String(req.body?.body || "").trim();
+
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
+    if (!body) {
+      return res.status(400).json({ error: "body is required" });
+    }
+
+    const userRecord = await findFirebaseUserByEmail(email);
+    const result = await sendPushToUser(userRecord.uid, {
+      title,
+      body,
+      data: { type: "admin" },
+    });
+
+    if (!result.ok) {
+      return res.status(400).json({
+        success: false,
+        reason: result.reason,
+        error: result.error || result.reason,
+        uid: userRecord.uid,
+      });
+    }
+
+    return res.json({
+      success: true,
+      uid: userRecord.uid,
+      messageId: result.messageId,
+    });
+  } catch (error) {
+    console.error("admin send-push error:", error);
+    return res.status(error.status || 500).json({
+      success: false,
+      error: error.message || "Could not send push",
+    });
+  }
+});
+
+
 // =====================================================
 // START SERVER
 // =====================================================
