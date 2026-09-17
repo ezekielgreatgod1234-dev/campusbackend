@@ -3075,67 +3075,365 @@ app.post(
 // =====================================================
 // 6. WELCOME EMAIL
 // =====================================================
+// IMPORTANT:
+// This email is sent ONLY after the user has verified
+// their email address. The frontend (Login.jsx) calls
+// this endpoint with the user's Firebase ID token right
+// after a successful, verified login. The endpoint is
+// idempotent: it checks users/{uid}.welcomeEmailSent so
+// a user can never receive the welcome email twice.
+//
+// POST /send-welcome-email
+// Auth: Bearer <firebase id token>
+// Body: {} (nothing required)
+// =====================================================
+
+const WELCOME_EMAIL_SUBJECT =
+  "Welcome to CampusMart 2.0";
+
+const WELCOME_SUPPORT_EMAIL =
+  "campusmart1234@gmail.com";
+
+function buildWelcomeEmailHtml(name) {
+  const safeName =
+    String(name || "there").replace(
+      /[<>]/g,
+      ""
+    );
+
+  const bullet = (label, text) => `
+    <tr>
+      <td
+        style="
+          padding:0 0 10px;
+          font-size:14px;
+          line-height:1.6;
+          color:#374151;
+        "
+      >
+        <strong style="color:#111827;">${label}</strong>
+        &mdash; ${text}
+      </td>
+    </tr>`;
+
+  return `
+    <p style="margin:0 0 14px;">
+      Hi ${safeName},
+    </p>
+
+    <p style="margin:0 0 14px;">
+      Welcome to CampusMart 2.0! We&rsquo;re excited to have
+      you join our campus community.
+    </p>
+
+    <p style="margin:0 0 14px;">
+      CampusMart is designed to make campus life easier by
+      giving students a simple and convenient way to discover
+      products from verified campus sellers, post or apply for
+      gigs, communicate with other users, and make secure
+      payments through Paystack.
+    </p>
+
+    <p style="margin:0 0 10px; font-weight:bold; color:#111827;">
+      With your CampusMart account, you can:
+    </p>
+
+    <table
+      width="100%"
+      cellpadding="0"
+      cellspacing="0"
+      style="margin:0 0 6px;"
+    >
+      ${bullet(
+        "Shop on Campus",
+        "Discover products and services offered by campus sellers."
+      )}
+      ${bullet(
+        "Find &amp; Post Gigs",
+        "Connect with students for opportunities, tasks, and services."
+      )}
+      ${bullet(
+        "Chat &amp; Connect",
+        "Communicate directly with buyers, sellers, and gig participants."
+      )}
+      ${bullet(
+        "Pay Securely",
+        "Enjoy secure payments powered by Paystack."
+      )}
+      ${bullet(
+        "Track Your Orders",
+        "Keep up with your purchases and order status in one place."
+      )}
+      ${bullet(
+        "Stay Updated",
+        "Receive important announcements and updates from CampusMart."
+      )}
+    </table>
+
+    <table
+      width="100%"
+      cellpadding="0"
+      cellspacing="0"
+      style="
+        margin:8px 0 16px;
+        background:#f0fdf4;
+        border:1px solid #bbf7d0;
+        border-radius:12px;
+      "
+    >
+      <tr>
+        <td style="padding:14px 16px;">
+          <p
+            style="
+              margin:0 0 8px;
+              font-weight:bold;
+              color:#065f46;
+              font-size:14px;
+            "
+          >
+            A quick safety reminder
+          </p>
+
+          <p
+            style="
+              margin:0 0 8px;
+              font-size:13px;
+              line-height:1.6;
+              color:#047857;
+            "
+          >
+            Your safety matters to us. Whenever possible, meet in
+            safe, public places on campus when completing
+            transactions or exchanging products.
+          </p>
+
+          <p
+            style="
+              margin:0;
+              font-size:13px;
+              line-height:1.6;
+              color:#047857;
+            "
+          >
+            Also, please check your email inbox and Spam/Junk
+            folder regularly so you don&rsquo;t miss important
+            CampusMart notifications.
+          </p>
+        </td>
+      </tr>
+    </table>
+
+    <p style="margin:0 0 14px;">
+      We&rsquo;re constantly improving CampusMart to make buying,
+      selling, and connecting on campus easier and more reliable.
+    </p>
+
+    <p style="margin:0 0 14px;">
+      Thank you for joining us, and welcome to CampusMart 2.0!
+    </p>
+
+    <table
+      align="center"
+      cellpadding="0"
+      cellspacing="0"
+      style="margin:4px 0 18px;"
+    >
+      <tr>
+        <td
+          style="
+            background:#008236;
+            border-radius:10px;
+          "
+        >
+          <a
+            href="${FRONTEND_URL}/dashboard"
+            style="
+              display:inline-block;
+              padding:12px 22px;
+              font-size:14px;
+              font-weight:bold;
+              color:#ffffff;
+              text-decoration:none;
+            "
+          >
+            Start exploring CampusMart
+          </a>
+        </td>
+      </tr>
+    </table>
+
+    <p style="margin:0 0 4px;">
+      Best regards,
+    </p>
+
+    <p style="margin:0; font-weight:bold; color:#111827;">
+      The CampusMart Team
+    </p>
+
+    <p style="margin:6px 0 0; font-size:13px;">
+      <a
+        href="mailto:${WELCOME_SUPPORT_EMAIL}"
+        style="color:#008236; text-decoration:none;"
+      >
+        ${WELCOME_SUPPORT_EMAIL}
+      </a>
+    </p>
+  `;
+}
+
+function buildWelcomeEmailText(name) {
+  const safeName = String(name || "there");
+
+  return [
+    `Hi ${safeName},`,
+    "",
+    "Welcome to CampusMart 2.0! We're excited to have you join our campus community.",
+    "",
+    "CampusMart is designed to make campus life easier by giving students a simple and convenient way to discover products from verified campus sellers, post or apply for gigs, communicate with other users, and make secure payments through Paystack.",
+    "",
+    "With your CampusMart account, you can:",
+    "- Shop on Campus: Discover products and services offered by campus sellers.",
+    "- Find & Post Gigs: Connect with students for opportunities, tasks, and services.",
+    "- Chat & Connect: Communicate directly with buyers, sellers, and gig participants.",
+    "- Pay Securely: Enjoy secure payments powered by Paystack.",
+    "- Track Your Orders: Keep up with your purchases and order status in one place.",
+    "- Stay Updated: Receive important announcements and updates from CampusMart.",
+    "",
+    "A quick safety reminder",
+    "Your safety matters to us. Whenever possible, meet in safe, public places on campus when completing transactions or exchanging products.",
+    "Also, please check your email inbox and Spam/Junk folder regularly so you don't miss important CampusMart notifications.",
+    "",
+    "We're constantly improving CampusMart to make buying, selling, and connecting on campus easier and more reliable.",
+    "",
+    "Thank you for joining us, and welcome to CampusMart 2.0!",
+    "",
+    "Best regards,",
+    "The CampusMart Team",
+    WELCOME_SUPPORT_EMAIL,
+  ].join("\n");
+}
 
 app.post(
   "/send-welcome-email",
   async (req, res) => {
     try {
-      const {
-        email,
-        fullName,
-      } = req.body || {};
+      // 1. Must be a logged-in user
+      const decoded =
+        await verifyFirebaseUser(req);
+
+      const uid = decoded.uid;
+
+      // 2. Must have a VERIFIED email.
+      //    We read from Firebase Auth (not the token) so a
+      //    user who just verified does not have to wait for
+      //    a fresh token.
+      let userRecord;
+
+      try {
+        userRecord =
+          await adminAuth.getUser(uid);
+      } catch (err) {
+        return res.status(404).json({
+          error: "User not found",
+        });
+      }
+
+      const email = String(
+        userRecord.email || ""
+      )
+        .trim()
+        .toLowerCase();
 
       if (!email) {
         return res.status(400).json({
           error:
-            "email is required",
+            "This account has no email address",
         });
       }
 
-      let title =
-        "Welcome to CampusMart 👋";
+      const isAdminAccount =
+        email ===
+        ADMIN_EMAIL.toLowerCase();
 
-      let body =
-        "Thanks for joining CampusMart! Browse products, chat sellers, and enjoy secure campus shopping.";
+      if (
+        !userRecord.emailVerified &&
+        !isAdminAccount
+      ) {
+        return res.status(403).json({
+          success: false,
 
-      let enabled =
-        true;
+          emailSent: false,
+
+          reason: "email_not_verified",
+
+          error:
+            "Welcome email is only sent after the email address is verified",
+        });
+      }
+
+      // 3. Never send it twice
+      const userRef = db
+        .collection("users")
+        .doc(uid);
+
+      let userData = {};
 
       try {
-        const snap =
-          await db
-            .collection(
-              "settings"
-            )
-            .doc(
-              "welcomeMessage"
-            )
-            .get();
+        const userSnap =
+          await userRef.get();
+
+        if (userSnap.exists) {
+          userData =
+            userSnap.data() || {};
+        }
+      } catch (err) {
+        console.warn(
+          "welcome email: could not read user doc:",
+          err.message
+        );
+      }
+
+      if (userData.welcomeEmailSent === true) {
+        return res.json({
+          success: true,
+
+          emailSent: false,
+
+          skipped: true,
+
+          reason: "already_sent",
+
+          message:
+            "Welcome email was already sent to this account",
+        });
+      }
+
+      // 4. Admin can switch welcome emails off, or
+      //    override the subject / body in Firestore at
+      //    settings/welcomeMessage
+      let enabled = true;
+      let customTitle = "";
+      let customBody = "";
+
+      try {
+        const snap = await db
+          .collection("settings")
+          .doc("welcomeMessage")
+          .get();
 
         if (snap.exists) {
-          const w =
-            snap.data() || {};
+          const w = snap.data() || {};
 
-          if (
-            w.enabled ===
-            false
-          ) {
-            enabled =
-              false;
+          if (w.enabled === false) {
+            enabled = false;
           }
 
           if (w.title) {
-            title =
-              String(
-                w.title
-              );
+            customTitle = String(w.title);
           }
 
           if (w.body) {
-            body =
-              String(
-                w.body
-              );
+            customBody = String(w.body);
           }
         }
       } catch (e) {
@@ -3149,67 +3447,66 @@ app.post(
         return res.json({
           success: true,
 
+          emailSent: false,
+
           skipped: true,
 
-          message:
-            "Welcome emails disabled",
+          reason: "disabled",
+
+          message: "Welcome emails disabled",
         });
       }
 
-      const name =
-        (
-          fullName ||
+      // 5. Personalise
+      const fullName = String(
+        userData.fullName ||
+          userRecord.displayName ||
           ""
-        )
-          .trim()
-          .split(/\s+/)[0] ||
-        "there";
+      ).trim();
 
-      const finalTitle =
-        title.replace(
-          /\{name\}/g,
-          name
-        );
+      const name =
+        fullName.split(/\s+/)[0] || "there";
 
-      const finalBody =
-        body.replace(
-          /\{name\}/g,
-          name
-        );
+      const subject = (
+        customTitle || WELCOME_EMAIL_SUBJECT
+      ).replace(/\{\{?name\}?\}/g, name);
 
-      const bodyHtml =
-        finalBody
-          .split("\n")
-          .map(
-            (line) =>
-              `<p style="margin:0 0 10px;">${line}</p>`
+      const bodyHtml = customBody
+        ? customBody
+            .replace(/\{\{?name\}?\}/g, name)
+            .split("\n")
+            .map(
+              (line) =>
+                `<p style="margin:0 0 10px;">${line}</p>`
+            )
+            .join("")
+        : buildWelcomeEmailHtml(name);
+
+      const bodyText = customBody
+        ? customBody.replace(
+            /\{\{?name\}?\}/g,
+            name
           )
-          .join("");
+        : buildWelcomeEmailText(name);
 
+      // 6. Send
       try {
         await sendMail({
-          to: String(
-            email
-          )
-            .trim()
-            .toLowerCase(),
+          to: email,
 
-          subject:
-            finalTitle,
+          subject,
 
-          html:
-            emailLayout({
-              title:
-                finalTitle,
+          html: emailLayout({
+            title: subject,
+            bodyHtml,
+          }),
 
-              bodyHtml,
-            }),
+          text: bodyText,
         });
       } catch (mailErr) {
         console.error(
           "Welcome email send failed:",
-          mailErr.response
-            ?.data ||
+          mailErr.response?.data ||
             mailErr.message
         );
 
@@ -3218,9 +3515,31 @@ app.post(
 
           emailSent: false,
 
+          reason: "mail_failed",
+
           message:
-            "Account created, but welcome email could not be sent",
+            "Could not send the welcome email right now",
         });
+      }
+
+      // 7. Mark as sent so it never repeats
+      try {
+        await userRef.set(
+          {
+            emailVerified: true,
+            welcomeEmailSent: true,
+            welcomeEmailSentAt:
+              FieldValue.serverTimestamp(),
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (err) {
+        console.warn(
+          "welcome email: could not flag user doc:",
+          err.message
+        );
       }
 
       return res.json({
@@ -3228,8 +3547,7 @@ app.post(
 
         emailSent: true,
 
-        message:
-          "Welcome email sent",
+        message: "Welcome email sent",
       });
     } catch (error) {
       console.error(
@@ -3237,11 +3555,13 @@ app.post(
         error
       );
 
-      return res.status(500).json({
-        error:
-          error.message ||
-          "Could not send welcome email",
-      });
+      return res
+        .status(error.status || 500)
+        .json({
+          error:
+            error.message ||
+            "Could not send welcome email",
+        });
     }
   }
 );
@@ -7262,6 +7582,9 @@ app.post("/admin/send-push", async (req, res) => {
     });
   }
 });
+
+
+
 
 
 // =====================================================
