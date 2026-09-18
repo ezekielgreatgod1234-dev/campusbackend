@@ -831,14 +831,39 @@ async function sendPushToUser(uid, { title, body, data } = {}) {
   const invalidTokens = [];
   let lastMessageId = null;
 
+  const iconUrl = `${String(link).replace(/\/$/, "")}/pwa-192x192.png`;
+
   for (const token of tokens) {
     try {
       lastMessageId = await messaging.send({
         token,
-        notification,
-        data: dataPayload,
+        // Top-level notification helps many clients show a system banner
+        notification: {
+          title: notification.title,
+          body: notification.body,
+        },
+        data: {
+          ...dataPayload,
+          title: notification.title,
+          body: notification.body,
+        },
         webpush: {
-          fcmOptions: { link },
+          headers: {
+            Urgency: "high",
+            TTL: "86400",
+          },
+          notification: {
+            title: notification.title,
+            body: notification.body,
+            icon: iconUrl,
+            badge: iconUrl,
+            vibrate: [200, 100, 200],
+            tag: dataPayload.type || "campusmart",
+            renotify: true,
+          },
+          fcmOptions: {
+            link,
+          },
         },
       });
       sent += 1;
